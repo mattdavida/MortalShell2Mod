@@ -8,6 +8,34 @@
 
 local UEHelpers = require("UEHelpers.UEHelpers")
 local ModMenu = require("ModMenu.ModMenu")
+local ConfigManager = require("ConfigManager.ConfigManager")
+local Tarstones = require("Tarstones")
+local Give = require("Give")
+local Character = require("Character")
+
+ConfigManager.Init({
+    id = "MortalShell2Mod",
+    defaults = {
+        keybinds = {},
+        moveMult = "2",
+        healPct = 100,
+        combat = {
+            heal = 100,
+            resolve = 100,
+        },
+        toggles = {
+            autoHeal = false,
+            infiniteResolve = false,
+            noAbilityCooldown = false,
+            alwaysParry = false,
+            alwaysPerfectBlock = false,
+            alwaysPerfectHarden = false,
+            extraMaxShellPoints = false,
+            moveFast = false,
+            god = false,
+        },
+    },
+})
 
 ModMenu.Init({
     title = "Mortal Shell 2",
@@ -15,6 +43,7 @@ ModMenu.Init({
     key = Key.F6,
     keyHint = "F6",
     dock = "right",
+    tabs = { "Cheats", "Shells", "Give", "Unlocks", "Keybinds" },
     fontTitle = 16,
     fontSection = 12,
     fontItem = 10,
@@ -25,14 +54,21 @@ ModMenu.Init({
 print("--------------------------------")
 print("|  Mortal Shell 2 Mod Loaded   |")
 print("|  F6 = Cheat menu             |")
+print("|  Tabs: Cheats / Shells / Give / Unlocks / Keybinds")
+print("|  Keybinds: saved, menu closed")
 print("|  Unlocks fire Steam achievements")
 print("--------------------------------")
 
 local SECTION_TOGGLES = "Toggles"
 local SECTION_UNLOCKS = "Unlocks"
-local SECTION_ITEMS = "Items"
+local SECTION_MAP = "Map"
+local SECTION_ITEMS = "Tarstones"
 local SECTION_ADD = "Add"
 local SECTION_COMBAT = "Combat"
+
+local TAB_CHEATS = "Cheats"
+local TAB_GIVE = "Give"
+local TAB_UNLOCKS = "Unlocks"
 
 local function Log(msg)
     print("[MortalShell2] " .. tostring(msg))
@@ -132,24 +168,42 @@ local function CallOnPlayerController(name, call)
 end
 
 --- Auto Heal / Infinite Resolve: cached poll only. Do not hook every attack.
-local TICK_MS = 1000
+local RESOLVE_TICK_MS = 1000
 local RESTART_DELAY_MS = 3000
 local HEAL_AMOUNT = 9999
 local RESOLVE_AMOUNT = 9999
 
 local autoHealOn = false
+local godOn = false
 local infiniteResolveOn = false
 local noCooldownOn = false
-local tickHandle = nil
+local alwaysParryOn = false
+local alwaysPerfectBlockOn = false
+local alwaysPerfectHardenOn = false
+local extraMaxShellPointsOn = false
+local healTickHandle = nil
+local resolveTickHandle = nil
 local cooldownTickHandle = nil
 --- [ability full name] = original cooldown fields (restored on toggle off)
 local cooldownSaved = {}
 
-local function CancelTick()
-    if tickHandle then
-        pcall(CancelDelayedAction, tickHandle)
-        tickHandle = nil
+local function CancelHealTick()
+    if healTickHandle then
+        pcall(CancelDelayedAction, healTickHandle)
+        healTickHandle = nil
     end
+end
+
+local function CancelResolveTick()
+    if resolveTickHandle then
+        pcall(CancelDelayedAction, resolveTickHandle)
+        resolveTickHandle = nil
+    end
+end
+
+local function CancelTick()
+    CancelHealTick()
+    CancelResolveTick()
 end
 
 ---@return USpartaHealthComponent|nil
@@ -163,6 +217,39 @@ local function GetHealthComponent(pc)
         return hc
     end
     return nil
+end
+
+--- Deal current shell HP so OnShellHealthDepleted can run (same path as a hit).
+---@param pc APlayerController
+---@return boolean
+local function TryBreakShell(pc)
+    local hc = GetHealthComponent(pc)
+    if not IsValid(hc) then
+        Log("Break Shell: no health component")
+        return false
+    end
+    local okRead, shellHp = pcall(function()
+        return hc:GetShellHealth()
+    end)
+    shellHp = okRead and tonumber(shellHp) or nil
+    if shellHp == nil then
+        Log("Break Shell: could not read shell health")
+        return false
+    end
+    if shellHp <= 0.5 then
+        Log("Break Shell: shell health already empty (" .. tostring(shellHp) .. ")")
+        return false
+    end
+    local amount = shellHp + 1
+    local ok, err = pcall(function()
+        pc:S_DealDamage(amount)
+    end)
+    if not ok then
+        Log("Break Shell: S_DealDamage failed - " .. tostring(err))
+        return false
+    end
+    Log(string.format("Break Shell: S_DealDamage(%.1f) shell was %.1f", amount, shellHp))
+    return true
 end
 
 local function AttrCurrent(data)
@@ -212,6 +299,25 @@ local function NeedsResolve(hc)
     return true
 end
 
+local function HealAmountForTick(hc)
+    local pct = Character.HealPercent()
+    local maxH = nil
+    if IsValid(hc) then
+        pcall(function()
+            maxH = tonumber(hc:GetMaxHealth())
+        end)
+        if maxH == nil or maxH <= 0 then
+            pcall(function()
+                maxH = tonumber(hc:GetMaxShellHealth())
+            end)
+        end
+    end
+    if maxH ~= nil and maxH > 0 then
+        return math.max(1, maxH * (pct / 100))
+    end
+    return math.max(1, HEAL_AMOUNT * (pct / 100))
+end
+
 local function ApplyAutoHeal(pc)
     if not autoHealOn then
         return
@@ -222,8 +328,9 @@ local function ApplyAutoHeal(pc)
     end
     local hc = GetHealthComponent(pc)
     if NeedsHeal(hc) then
+        local amount = HealAmountForTick(hc)
         pcall(function()
-            pc:S_Heal(HEAL_AMOUNT)
+            pc:S_Heal(amount)
         end)
     end
 end
@@ -244,30 +351,53 @@ local function ApplyInfiniteResolve(pc)
     end
 end
 
-local function TickToggles()
-    if not autoHealOn and not infiniteResolveOn then
+local function TickHeal()
+    if not autoHealOn then
         return
     end
-    local pc = GetPlayerController()
-    if not pc then
+    ApplyAutoHeal()
+end
+
+local function TickResolve()
+    if not infiniteResolveOn then
         return
     end
-    ApplyAutoHeal(pc)
-    ApplyInfiniteResolve(pc)
+    ApplyInfiniteResolve()
+end
+
+local function EnsureHealTick()
+    if healTickHandle or not autoHealOn then
+        return
+    end
+    healTickHandle = LoopInGameThreadWithDelay(Character.HealDelayMs(), TickHeal)
+end
+
+local function EnsureResolveTick()
+    if resolveTickHandle or not infiniteResolveOn then
+        return
+    end
+    resolveTickHandle = LoopInGameThreadWithDelay(RESOLVE_TICK_MS, TickResolve)
 end
 
 local function EnsureTick()
-    if tickHandle then
-        return
-    end
-    tickHandle = LoopInGameThreadWithDelay(TICK_MS, TickToggles)
+    EnsureHealTick()
+    EnsureResolveTick()
 end
 
+local function RestartHealTick()
+    CancelHealTick()
+    EnsureHealTick()
+end
+
+Character.NotifyHealDelayChanged = RestartHealTick
+
 local function StopTickIfIdle()
-    if autoHealOn or infiniteResolveOn then
-        return
+    if not autoHealOn then
+        CancelHealTick()
     end
-    CancelTick()
+    if not infiniteResolveOn then
+        CancelResolveTick()
+    end
 end
 
 --- Safety net only. Hooks strip cooldown on apply; do not rescan/rewrite every tick.
@@ -678,6 +808,101 @@ end
 HookPlayerCooldownApply("/Script/Sparta.SpartaGameplayAbility:ApplyLocalCooldown", true, false)
 HookPlayerCooldownApply("/Script/Sparta.SpartaGameplayAbility:ApplyGlobalCooldown", false, true)
 
+---@param pawn APawn|nil
+---@return boolean|nil
+local function PawnCanBeDamaged(pawn)
+    if not IsValid(pawn) then
+        return nil
+    end
+    local ok, v = pcall(function()
+        return pawn.bCanBeDamaged
+    end)
+    if not ok or v == nil then
+        return nil
+    end
+    if v == false or v == 0 then
+        return false
+    end
+    return true
+end
+
+---@return UCheatManager|nil
+local function GetCheatManager()
+    local pc = GetPlayerController()
+    if not pc then
+        return nil
+    end
+    local cm = nil
+    pcall(function()
+        cm = pc.CheatManager
+    end)
+    if IsValid(cm) then
+        return cm
+    end
+    pcall(function()
+        pc:EnableCheats()
+    end)
+    pcall(function()
+        cm = pc.CheatManager
+    end)
+    if IsValid(cm) then
+        return cm
+    end
+    return nil
+end
+
+--- Engine God() toggles CanBeDamaged. Only call when the pawn is not already
+--- in the wanted state, then write bCanBeDamaged so polarity cannot drift.
+---@param wantOn boolean
+---@return boolean
+local function ApplyGod(wantOn)
+    local cm = GetCheatManager()
+    if not IsValid(cm) then
+        return false
+    end
+    local pawn = GetPlayerPawn()
+    local canDamage = PawnCanBeDamaged(pawn)
+    if canDamage ~= nil then
+        local isGod = not canDamage
+        if isGod ~= wantOn then
+            local ok = pcall(function()
+                cm:God()
+            end)
+            if not ok then
+                return false
+            end
+        end
+    else
+        local ok = pcall(function()
+            cm:God()
+        end)
+        if not ok then
+            return false
+        end
+    end
+    if IsValid(pawn) then
+        pcall(function()
+            pawn.bCanBeDamaged = not wantOn
+        end)
+    end
+    return true
+end
+
+local function GodOn()
+    godOn = true
+    if ApplyGod(true) then
+        Log("God: ON")
+    else
+        Log("God: ON (waiting for world)")
+    end
+end
+
+local function GodOff()
+    godOn = false
+    ApplyGod(false)
+    Log("God: OFF")
+end
+
 local function AutoHealOn()
     autoHealOn = true
     GetPlayerPawn()
@@ -706,15 +931,392 @@ local function InfiniteResolveOff()
     Log("Infinite Resolve: OFF")
 end
 
+local EXTRA_MAX_SHELL_POINTS = 100
+--- [tag string] = original StartingMaxShellPoints
+local shellPointsSaved = {}
+
+---@return UObject|nil
+local function GetProgressionComponent(pc)
+    pc = pc or GetPlayerController()
+    if not pc then
+        return nil
+    end
+    local names = { "Progression Component", "ProgressionComponent" }
+    for i = 1, #names do
+        local comp = nil
+        pcall(function()
+            comp = pc[names[i]]
+        end)
+        if IsValid(comp) then
+            return comp
+        end
+    end
+    local found = FindAllOf("BPC_Player_Progression_C")
+    if found then
+        for _, obj in ipairs(found) do
+            local skip = false
+            pcall(function()
+                local name = obj:GetFullName()
+                if type(name) == "string" and name:find("Default__", 1, true) then
+                    skip = true
+                end
+            end)
+            if IsValid(obj) and not skip then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+---@param tag any
+---@return string|nil
+local function ShellPointKey(tag)
+    tag = UnwrapParam(tag)
+    if tag == nil then
+        return nil
+    end
+    if type(tag) == "string" and tag ~= "" then
+        return tag
+    end
+    local ok, name = pcall(function()
+        local n = tag.TagName
+        if n ~= nil then
+            if type(n) == "string" then
+                return n
+            end
+            if type(n.ToString) == "function" then
+                return n:ToString()
+            end
+        end
+        if type(tag.ToString) == "function" then
+            return tag:ToString()
+        end
+        return nil
+    end)
+    if ok and type(name) == "string" and name ~= "" then
+        return name
+    end
+    return nil
+end
+
+---@param value any
+---@return number|nil
+local function MapInt(value)
+    value = UnwrapParam(value)
+    return tonumber(value)
+end
+
+---@param map any
+---@param key any
+---@param valueWrap any
+---@param newVal number
+---@return boolean
+local function WriteMapInt(map, key, valueWrap, newVal)
+    if valueWrap ~= nil and type(valueWrap.set) == "function" then
+        local ok = pcall(function()
+            valueWrap:set(newVal)
+        end)
+        if ok then
+            return true
+        end
+    end
+    local ok = pcall(function()
+        map:Add(UnwrapParam(key) or key, newVal)
+    end)
+    return ok
+end
+
+---@param restore boolean
+---@return integer
+local function ApplyStartingMaxShellPoints(restore)
+    local comp = GetProgressionComponent()
+    if not IsValid(comp) then
+        return 0
+    end
+    local map = nil
+    pcall(function()
+        map = comp.StartingMaxShellPoints
+    end)
+    if map == nil or type(map.ForEach) ~= "function" then
+        return 0
+    end
+    local n = 0
+    map:ForEach(function(key, value)
+        local id = ShellPointKey(key)
+        local current = MapInt(value)
+        if id and shellPointsSaved[id] == nil and current ~= nil then
+            shellPointsSaved[id] = current
+        end
+        local target = EXTRA_MAX_SHELL_POINTS
+        if restore then
+            target = (id and shellPointsSaved[id]) or current
+        end
+        if target ~= nil and WriteMapInt(map, key, value, target) then
+            n = n + 1
+        end
+    end)
+    return n
+end
+
+local function ExtraMaxShellPointsOn()
+    GetPlayerPawn()
+    local n = ApplyStartingMaxShellPoints(false)
+    if n == 0 then
+        extraMaxShellPointsOn = false
+        ModMenu.Set(SECTION_TOGGLES, "extraMaxShellPoints", false)
+        Log("Max Shell Points: OFF — progression component not found")
+        return
+    end
+    extraMaxShellPointsOn = true
+    Log(string.format("Max Shell Points: ON (%d shells -> %d)", n, EXTRA_MAX_SHELL_POINTS))
+end
+
+local function ExtraMaxShellPointsOff()
+    extraMaxShellPointsOn = false
+    local n = ApplyStartingMaxShellPoints(true)
+    Log(string.format("Max Shell Points: OFF (%d shells restored)", n))
+end
+
+--- Blueprint abilities are not loaded until a pawn exists.
+--- Register on ClientRestart; UnregisterHook first so restarts do not stack.
+
+---@param classPath string
+---@return boolean
+local function BlueprintClassLoaded(classPath)
+    local name = classPath:match("([^./]+)$")
+    if type(name) ~= "string" or name == "" then
+        return false
+    end
+    local obj = FindFirstOf(name)
+    return IsValid(obj)
+end
+
+---@param state { prefix: string, classPath: string, isOn: fun(): boolean, entries: table }
+---@param entry { name: string, whenOn: boolean, preId: integer|nil, postId: integer|nil }
+local function UnhookBlueprintBool(state, entry)
+    if entry.preId == nil and entry.postId == nil then
+        return
+    end
+    local path = state.classPath .. ":" .. entry.name
+    local ok, err = pcall(UnregisterHook, path, entry.preId, entry.postId)
+    if not ok then
+        Log(state.prefix .. ": unhook failed " .. entry.name .. " — " .. tostring(err))
+    end
+    entry.preId = nil
+    entry.postId = nil
+end
+
+---@param state { prefix: string, classPath: string, isOn: fun(): boolean, entries: table }
+---@param entry { name: string, whenOn: boolean, preId: integer|nil, postId: integer|nil }
+---@return boolean
+local function HookBlueprintBool(state, entry)
+    UnhookBlueprintBool(state, entry)
+    local path = state.classPath .. ":" .. entry.name
+    local ok, preId, postId = pcall(function()
+        return RegisterHook(path, function()
+            if not state.isOn() then
+                return
+            end
+            return entry.whenOn
+        end)
+    end)
+    if not ok then
+        Log(state.prefix .. ": failed to hook " .. entry.name .. " — " .. tostring(preId))
+        entry.preId = nil
+        entry.postId = nil
+        return false
+    end
+    entry.preId = preId
+    entry.postId = postId
+    return true
+end
+
+---@param state { prefix: string, classPath: string, isOn: fun(): boolean, entries: table }
+---@return boolean
+local function EnsureBlueprintBoolHooks(state)
+    local n = 0
+    for i = 1, #state.entries do
+        if HookBlueprintBool(state, state.entries[i]) then
+            n = n + 1
+        end
+    end
+    return n == #state.entries
+end
+
+local parryHookState = {
+    prefix = "Auto Parry on Hit",
+    classPath = "/Game/Sparta/Core/Player/Ability/Parry/GA_Parry_Handler.GA_Parry_Handler_C",
+    isOn = function()
+        return alwaysParryOn
+    end,
+    entries = {
+        { name = "IsInParryWindow",       whenOn = true,  preId = nil, postId = nil },
+        { name = "IsUnparryableAttack",   whenOn = false, preId = nil, postId = nil },
+        { name = "IsParryingAICharacter", whenOn = true,  preId = nil, postId = nil },
+    },
+}
+
+local perfectBlockHookState = {
+    prefix = "Always Perfect Block",
+    classPath = "/Game/Sparta/Core/Characters/Player/Common/Abilities/ActiveBlock/GA_ActiveBlock.GA_ActiveBlock_C",
+    isOn = function()
+        return alwaysPerfectBlockOn
+    end,
+    entries = {
+        { name = "CanPerfectBlock", whenOn = true, preId = nil, postId = nil },
+    },
+}
+
+local perfectHardenHookState = {
+    prefix = "Always Perfect Harden",
+    classPath = "/Game/Sparta/Core/Characters/Player/Common/Abilities/StoneForm/GA_Harden_Original.GA_Harden_Original_C",
+    isOn = function()
+        return alwaysPerfectHardenOn
+    end,
+    entries = {
+        { name = "IsInPerfectStoneForm", whenOn = true, preId = nil, postId = nil },
+    },
+}
+
+local PARRY_SEAL_NOTE = "Infinite Seal must be equipped. Equip and try again."
+local BLOCK_SEAL_NOTE = "Untarnished Seal must be equipped. Equip and try again."
+local HARDEN_SEAL_NOTE = "Vatra's Seal must be equipped. Equip and try again."
+
+---@param on boolean
+---@param checkboxId string
+---@param noteId string
+---@param note string
+local function SetSealToggleUi(on, checkboxId, noteId, note)
+    ModMenu.Set(SECTION_TOGGLES, checkboxId, on)
+    ModMenu.SetLabel(SECTION_TOGGLES, noteId, note or "")
+end
+
+---@param state table
+---@param setOn fun(on: boolean)
+---@param checkboxId string
+---@param noteId string
+---@param failNote string
+---@return boolean
+local function TryEnableSealToggle(state, setOn, checkboxId, noteId, failNote)
+    if not GetPlayerPawn() or not BlueprintClassLoaded(state.classPath) then
+        setOn(false)
+        SetSealToggleUi(false, checkboxId, noteId, failNote)
+        Log(state.prefix .. ": OFF — ability not loaded")
+        return false
+    end
+    local ok = EnsureBlueprintBoolHooks(state)
+    if not ok then
+        setOn(false)
+        SetSealToggleUi(false, checkboxId, noteId, failNote)
+        Log(state.prefix .. ": OFF — ability not loaded")
+        return false
+    end
+    setOn(true)
+    SetSealToggleUi(true, checkboxId, noteId, "")
+    Log(state.prefix .. ": ON")
+    return true
+end
+
+local function AlwaysParryOn()
+    TryEnableSealToggle(parryHookState, function(on)
+        alwaysParryOn = on
+    end, "alwaysParry", "alwaysParryNote", PARRY_SEAL_NOTE)
+end
+
+local function AlwaysParryOff()
+    alwaysParryOn = false
+    SetSealToggleUi(false, "alwaysParry", "alwaysParryNote", "")
+    Log("Auto Parry on Hit: OFF")
+end
+
+local function AlwaysPerfectBlockOn()
+    TryEnableSealToggle(perfectBlockHookState, function(on)
+        alwaysPerfectBlockOn = on
+    end, "alwaysPerfectBlock", "alwaysPerfectBlockNote", BLOCK_SEAL_NOTE)
+end
+
+local function AlwaysPerfectBlockOff()
+    alwaysPerfectBlockOn = false
+    SetSealToggleUi(false, "alwaysPerfectBlock", "alwaysPerfectBlockNote", "")
+    Log("Always Perfect Block: OFF")
+end
+
+local function AlwaysPerfectHardenOn()
+    TryEnableSealToggle(perfectHardenHookState, function(on)
+        alwaysPerfectHardenOn = on
+    end, "alwaysPerfectHarden", "alwaysPerfectHardenNote", HARDEN_SEAL_NOTE)
+end
+
+local function AlwaysPerfectHardenOff()
+    alwaysPerfectHardenOn = false
+    SetSealToggleUi(false, "alwaysPerfectHarden", "alwaysPerfectHardenNote", "")
+    Log("Always Perfect Harden: OFF")
+end
+
+---@param id string
+---@return boolean
+local function ToggleSaved(id)
+    local t = ConfigManager.Get("toggles")
+    return type(t) == "table" and t[id] == true
+end
+
+---@param id string
+---@param on boolean
+local function SetToggleSaved(id, on)
+    local t = ConfigManager.Get("toggles")
+    if type(t) ~= "table" then
+        t = {}
+    end
+    t[id] = on and true or false
+    ConfigManager.Set("toggles", t)
+end
+
+--- Keep saved intent on if the ability is not loaded yet (retry after ClientRestart).
+---@param state table
+---@param checkboxId string
+---@param noteId string
+---@param failNote string
+local function ReapplySealToggle(state, checkboxId, noteId, failNote)
+    if not GetPlayerPawn() then
+        return
+    end
+    if not BlueprintClassLoaded(state.classPath) then
+        SetSealToggleUi(true, checkboxId, noteId, failNote)
+        Log(state.prefix .. ": waiting — " .. failNote)
+        return
+    end
+    if EnsureBlueprintBoolHooks(state) then
+        SetSealToggleUi(true, checkboxId, noteId, "")
+        Log(state.prefix .. ": ON")
+        return
+    end
+    SetSealToggleUi(true, checkboxId, noteId, failNote)
+    Log(state.prefix .. ": waiting — " .. failNote)
+end
+
 local function ReapplyTogglesAfterRestart()
     InvalidatePlayerCache()
     CancelTick()
     CancelCooldownTick()
-    if not autoHealOn and not infiniteResolveOn and not noCooldownOn then
-        return
-    end
     ExecuteInGameThreadWithDelay(RESTART_DELAY_MS, function()
         InvalidatePlayerCache()
+        if alwaysParryOn then
+            ReapplySealToggle(parryHookState, "alwaysParry", "alwaysParryNote", PARRY_SEAL_NOTE)
+        end
+        if alwaysPerfectBlockOn then
+            ReapplySealToggle(perfectBlockHookState, "alwaysPerfectBlock", "alwaysPerfectBlockNote", BLOCK_SEAL_NOTE)
+        end
+        if alwaysPerfectHardenOn then
+            ReapplySealToggle(perfectHardenHookState, "alwaysPerfectHarden", "alwaysPerfectHardenNote", HARDEN_SEAL_NOTE)
+        end
+        if extraMaxShellPointsOn then
+            ApplyStartingMaxShellPoints(false)
+        end
+        Character.Reapply()
+        if godOn then
+            ApplyGod(true)
+        end
         if autoHealOn or infiniteResolveOn then
             EnsureTick()
             local pc = GetPlayerController()
@@ -730,7 +1332,9 @@ local function ReapplyTogglesAfterRestart()
             end
             EnsureCooldownTick()
         end
-        if autoHealOn or infiniteResolveOn or noCooldownOn then
+        if godOn or autoHealOn or infiniteResolveOn or noCooldownOn
+            or alwaysParryOn or alwaysPerfectBlockOn or alwaysPerfectHardenOn
+            or extraMaxShellPointsOn then
             Log("Toggles re-applied after ClientRestart")
         end
     end)
@@ -740,16 +1344,46 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
     ReapplyTogglesAfterRestart()
 end)
 
+autoHealOn = ToggleSaved("autoHeal")
+godOn = ToggleSaved("god")
+infiniteResolveOn = ToggleSaved("infiniteResolve")
+noCooldownOn = ToggleSaved("noAbilityCooldown")
+alwaysParryOn = ToggleSaved("alwaysParry")
+alwaysPerfectBlockOn = ToggleSaved("alwaysPerfectBlock")
+alwaysPerfectHardenOn = ToggleSaved("alwaysPerfectHarden")
+extraMaxShellPointsOn = ToggleSaved("extraMaxShellPoints")
+Character.RestoreMoveFast(ToggleSaved("moveFast"))
+
 ModMenu.Register({
     id = SECTION_TOGGLES,
     title = "Toggles",
+    tab = TAB_CHEATS,
     items = {
+        {
+            type = "label",
+            label = "Saved to config. Re-applied when you load into a world.",
+        },
+        {
+            type = "checkbox",
+            id = "god",
+            label = "God",
+            default = godOn,
+            onChange = function(on)
+                SetToggleSaved("god", on)
+                if on then
+                    GodOn()
+                else
+                    GodOff()
+                end
+            end,
+        },
         {
             type = "checkbox",
             id = "autoHeal",
             label = "Auto Heal",
-            default = false,
+            default = autoHealOn,
             onChange = function(on)
+                SetToggleSaved("autoHeal", on)
                 if on then
                     AutoHealOn()
                 else
@@ -761,8 +1395,9 @@ ModMenu.Register({
             type = "checkbox",
             id = "infiniteResolve",
             label = "Infinite Resolve",
-            default = false,
+            default = infiniteResolveOn,
             onChange = function(on)
+                SetToggleSaved("infiniteResolve", on)
                 if on then
                     InfiniteResolveOn()
                 else
@@ -774,8 +1409,9 @@ ModMenu.Register({
             type = "checkbox",
             id = "noAbilityCooldown",
             label = "No Ability Cooldown",
-            default = false,
+            default = noCooldownOn,
             onChange = function(on)
+                SetToggleSaved("noAbilityCooldown", on)
                 if on then
                     NoCooldownOn()
                 else
@@ -783,22 +1419,168 @@ ModMenu.Register({
                 end
             end,
         },
+        {
+            type = "checkbox",
+            id = "alwaysParry",
+            label = "Auto Parry on Hit",
+            default = alwaysParryOn,
+            onChange = function(on)
+                SetToggleSaved("alwaysParry", on)
+                if on then
+                    AlwaysParryOn()
+                else
+                    AlwaysParryOff()
+                end
+            end,
+        },
+        {
+            type = "label",
+            id = "alwaysParryNote",
+            label = "",
+        },
+        {
+            type = "checkbox",
+            id = "alwaysPerfectBlock",
+            label = "Always Perfect Block",
+            default = alwaysPerfectBlockOn,
+            onChange = function(on)
+                SetToggleSaved("alwaysPerfectBlock", on)
+                if on then
+                    AlwaysPerfectBlockOn()
+                else
+                    AlwaysPerfectBlockOff()
+                end
+            end,
+        },
+        {
+            type = "label",
+            id = "alwaysPerfectBlockNote",
+            label = "",
+        },
+        {
+            type = "checkbox",
+            id = "alwaysPerfectHarden",
+            label = "Always Perfect Harden",
+            default = alwaysPerfectHardenOn,
+            onChange = function(on)
+                SetToggleSaved("alwaysPerfectHarden", on)
+                if on then
+                    AlwaysPerfectHardenOn()
+                else
+                    AlwaysPerfectHardenOff()
+                end
+            end,
+        },
+        {
+            type = "label",
+            id = "alwaysPerfectHardenNote",
+            label = "",
+        },
+        {
+            type = "checkbox",
+            id = "extraMaxShellPoints",
+            label = "Max Shell Points 100",
+            default = extraMaxShellPointsOn,
+            onChange = function(on)
+                SetToggleSaved("extraMaxShellPoints", on)
+                if on then
+                    ExtraMaxShellPointsOn()
+                else
+                    ExtraMaxShellPointsOff()
+                end
+            end,
+        },
+        {
+            type = "checkbox",
+            id = "moveFast",
+            label = "Move Fast",
+            default = Character.IsMoveFast(),
+            onChange = function(on)
+                SetToggleSaved("moveFast", on)
+                Character.SetMoveFast(on)
+            end,
+        },
     },
 })
 
-require("Shells").Register()
+Character.Register()
 
----@param id string
----@param label string
----@param name string
----@param call fun(pc: APlayerController)
-local function PcButton(id, label, name, call)
+local Shells = require("Shells")
+Shells.OnChanged(function()
+    Character.RegisterShellToggles()
+end)
+Shells.Register()
+
+local FLASH_MS = 300
+local buttonFlashHandles = {}
+local toastHandles = {}
+
+local TOAST_ID = {
+    [SECTION_UNLOCKS] = "unlockToast",
+    [SECTION_MAP] = "mapToast",
+    [SECTION_ITEMS] = "tarAddToast",
+}
+
+---@param key string
+---@param handles table
+local function CancelHandle(handles, key)
+    local handle = handles[key]
+    if handle then
+        pcall(CancelDelayedAction, handle)
+        handles[key] = nil
+    end
+end
+
+---@param sectionId string
+---@param itemId string
+---@param restoreVariant string
+---@param ok boolean
+---@param caption string
+local function FlashUnlockFeedback(sectionId, itemId, restoreVariant, ok, caption)
+    local flashKey = sectionId .. ":" .. itemId
+    CancelHandle(buttonFlashHandles, flashKey)
+    local flashVariant = ok and "success" or "danger"
+    pcall(function()
+        ModMenu.SetButtonVariant(sectionId, itemId, flashVariant)
+    end)
+    buttonFlashHandles[flashKey] = ExecuteInGameThreadWithDelay(FLASH_MS, function()
+        buttonFlashHandles[flashKey] = nil
+        pcall(function()
+            ModMenu.SetButtonVariant(sectionId, itemId, restoreVariant)
+        end)
+    end)
+
+    local toastId = TOAST_ID[sectionId]
+    if toastId then
+        CancelHandle(toastHandles, sectionId)
+        local text
+        if ok then
+            text = "Done — " .. caption
+        elseif GetPlayerController() then
+            text = "Failed — " .. caption
+        else
+            text = "Skipped — load into a world first"
+        end
+        ModMenu.SetLabel(sectionId, toastId, text)
+        toastHandles[sectionId] = ExecuteInGameThreadWithDelay(FLASH_MS, function()
+            toastHandles[sectionId] = nil
+            ModMenu.SetLabel(sectionId, toastId, "")
+        end)
+    end
+end
+
+local function PcButton(id, label, name, call, variant, sectionId)
+    local restore = variant or "default"
     return {
         type = "button",
         id = id,
         label = label,
+        variant = variant,
         onClick = function()
-            CallOnPlayerController(name, call)
+            local ok = CallOnPlayerController(name, call)
+            if sectionId then
+                FlashUnlockFeedback(sectionId, id, restore, ok, label)
+            end
         end,
     }
 end
@@ -913,7 +1695,6 @@ local function UnlockAllShellsThorough(pc)
     local function note(name)
         if type(name) == "string" and name ~= "" and not unlockedNames[name] then
             unlockedNames[name] = true
-            Log("Unlocked shell: " .. name)
         end
     end
 
@@ -990,6 +1771,33 @@ end
 --- Shared column widths so label / field / Add line up across rows.
 local AMOUNT_LABEL_WIDTH = 150
 local AMOUNT_FIELD_WIDTH = 72
+local DEFAULT_COMBAT_AMOUNT = 100
+
+---@param field string
+---@return integer
+local function CombatAmount(field)
+    local combat = ConfigManager.Get("combat")
+    local n = tonumber(type(combat) == "table" and combat[field] or nil)
+    if n == nil or n ~= n or n == math.huge or n == -math.huge then
+        return DEFAULT_COMBAT_AMOUNT
+    end
+    n = math.floor(n)
+    if n < 1 then
+        return DEFAULT_COMBAT_AMOUNT
+    end
+    return n
+end
+
+---@param field string
+---@param n integer
+local function SetCombatAmount(field, n)
+    local combat = ConfigManager.Get("combat")
+    if type(combat) ~= "table" then
+        combat = {}
+    end
+    combat[field] = n
+    ConfigManager.Set("combat", combat)
+end
 
 --- Row: integer amount field + Add button. Reads ModMenu.Get(sectionId, amountId).
 ---@param sectionId string
@@ -998,7 +1806,8 @@ local AMOUNT_FIELD_WIDTH = 72
 ---@param name string
 ---@param callWithAmount fun(pc: APlayerController, n: integer)
 ---@param default integer|nil
-local function AmountRow(sectionId, id, label, name, callWithAmount, default)
+---@param onAmountChange fun(n: integer)|nil
+local function AmountRow(sectionId, id, label, name, callWithAmount, default, onAmountChange)
     local amountId = id .. "Amount"
     return {
         type = "row",
@@ -1012,6 +1821,17 @@ local function AmountRow(sectionId, id, label, name, callWithAmount, default)
                 integer = true,
                 labelWidth = AMOUNT_LABEL_WIDTH,
                 fieldWidth = AMOUNT_FIELD_WIDTH,
+                onChange = onAmountChange ~= nil and function(value)
+                    local n = tonumber(value)
+                    if n == nil or n ~= n then
+                        return
+                    end
+                    n = math.floor(n)
+                    if n < 1 then
+                        return
+                    end
+                    onAmountChange(n)
+                end or nil,
             },
             {
                 type = "button",
@@ -1036,44 +1856,107 @@ end
 ModMenu.Register({
     id = SECTION_UNLOCKS,
     title = "Unlocks",
+    tab = TAB_UNLOCKS,
+    collapsible = true,
+    collapsed = false,
     items = {
         {
             type = "label",
             label = "Steam achievements unlock with these. Load into a world first.",
         },
         { type = "separator" },
-        PcButton("clothing", "Unlock All Clothing", "S_UnlockAllClothing", function(pc) pc:S_UnlockAllClothing() end),
-        PcButton("gates", "Unlock All Gates", "S_UnlockAllGates", function(pc) pc:S_UnlockAllGates() end),
+        PcButton("clothing", "Unlock All Clothing", "S_UnlockAllClothing", function(pc) pc:S_UnlockAllClothing() end, nil, SECTION_UNLOCKS),
+        PcButton("gates", "Unlock All Gates", "S_UnlockAllGates", function(pc) pc:S_UnlockAllGates() end, nil, SECTION_UNLOCKS),
         PcButton("landing", "Unlock All Landing Areas", "S_UnlockAllLandingAreas",
-            function(pc) pc:S_UnlockAllLandingAreas() end),
-        PcButton("masks", "Unlock All Masks", "S_UnlockAllMasks", function(pc) pc:S_UnlockAllMasks() end),
-        PcButton("seals", "Unlock All Seals", "S_UnlockAllSeals", function(pc) pc:S_UnlockAllSeals() end),
-        PcButton("shells", "Unlock All Shells", "UnlockAllShells", UnlockAllShellsThorough),
-        PcButton("sidearms", "Unlock All Sidearms", "S_UnlockAllSidearms", function(pc) pc:S_UnlockAllSidearms() end),
-        PcButton("weapons", "Unlock All Weapons", "S_UnlockAllWeapons", function(pc) pc:S_UnlockAllWeapons() end),
+            function(pc) pc:S_UnlockAllLandingAreas() end, nil, SECTION_UNLOCKS),
+        PcButton("masks", "Unlock All Masks", "S_UnlockAllMasks", function(pc) pc:S_UnlockAllMasks() end, nil, SECTION_UNLOCKS),
+        PcButton("seals", "Unlock All Seals", "S_UnlockAllSeals", function(pc) pc:S_UnlockAllSeals() end, nil, SECTION_UNLOCKS),
+        PcButton("shells", "Unlock All Shells", "UnlockAllShells", UnlockAllShellsThorough, nil, SECTION_UNLOCKS),
+        PcButton("sidearms", "Unlock All Sidearms", "S_UnlockAllSidearms", function(pc) pc:S_UnlockAllSidearms() end, nil, SECTION_UNLOCKS),
+        PcButton("weapons", "Unlock All Weapons", "S_UnlockAllWeapons", function(pc) pc:S_UnlockAllWeapons() end, nil, SECTION_UNLOCKS),
+        PcButton("shellShades", "Unlock Shell Shades", "S_UnlockShellShades",
+            function(pc) pc:S_UnlockShellShades() end, nil, SECTION_UNLOCKS),
+        PcButton("red", "Unlock Red Harbinger", "S_UnlockRedHarbinger",
+            function(pc) pc:S_UnlockRedHarbinger() end, nil, SECTION_UNLOCKS),
+        PcButton("cosmic", "Unlock Cosmic Harbinger", "S_UnlockCosmicHarbinger",
+            function(pc) pc:S_UnlockCosmicHarbinger() end, nil, SECTION_UNLOCKS),
+        PcButton("darkShades", "Unlock Dark Form Shades", "S_UnlockDarkFormShades",
+            function(pc) pc:S_UnlockDarkFormShades() end, nil, SECTION_UNLOCKS),
+        {
+            type = "label",
+            id = "unlockToast",
+            label = "",
+        },
+    },
+})
+
+ModMenu.Register({
+    id = SECTION_MAP,
+    title = "Map",
+    tab = TAB_UNLOCKS,
+    collapsible = true,
+    collapsed = true,
+    items = {
+        {
+            type = "label",
+            label = "Unlock Map fills the map. Reveal All paints every icon and autosaves — cannot undo.",
+        },
+        PcButton("unlockMap", "Unlock Map", "S_UnlockMap", function(pc) pc:S_UnlockMap() end, "primary", SECTION_MAP),
+        PcButton("fastTravel", "Unlock Fast Travel", "S_UnlockFastTravel",
+            function(pc) pc:S_UnlockFastTravel() end, nil, SECTION_MAP),
+        PcButton("revealAll", "Reveal All Icons", "S_MapReveal_All",
+            function(pc) pc:S_MapReveal_All() end, "warning", SECTION_MAP),
+        {
+            type = "label",
+            id = "mapToast",
+            label = "",
+        },
     },
 })
 
 ModMenu.Register({
     id = SECTION_ITEMS,
-    title = "Items & Tarstones",
+    title = "Tarstones",
+    tab = TAB_GIVE,
+    collapsible = true,
+    collapsed = true,
     items = {
-        PcButton("allItems", "Add All Items", "S_AddAllItems", function(pc) pc:S_AddAllItems() end),
-        { type = "separator" },
         PcButton("tarMelee", "Add All Tarstones (Melee)", "S_AddAllTarstonesMelee",
-            function(pc) pc:S_AddAllTarstonesMelee() end),
+            function(pc) pc:S_AddAllTarstonesMelee() end, nil, SECTION_ITEMS),
         PcButton("tarSupport", "Add All Tarstones (Support)", "S_AddAllTarstonesSupport",
-            function(pc) pc:S_AddAllTarstonesSupport() end),
+            function(pc) pc:S_AddAllTarstonesSupport() end, nil, SECTION_ITEMS),
         PcButton("tarSidearm", "Add All Tarstones (Sidearm)", "S_AddAllTarstonesSidearm",
-            function(pc) pc:S_AddAllTarstonesSidearm() end),
-        PcButton("tarLevel", "Increment All Tarstone Levels", "S_TarstoneLevelIncrementall",
-            function(pc) pc:S_TarstoneLevelIncrementall() end),
+            function(pc) pc:S_AddAllTarstonesSidearm() end, nil, SECTION_ITEMS),
+        {
+            type = "label",
+            id = "tarAddToast",
+            label = "",
+        },
+        {
+            type = "label",
+            id = "tarLevelStatus",
+            label = "Tarstone level: 1 / 3",
+        },
+        PcButton("tarLevel", "Increment All Tarstone Levels", "TarstoneLevels+1",
+            function(pc) Tarstones.IncrementAll(pc) end),
+        PcButton("tarLevelDown", "Decrement All Tarstone Levels", "TarstoneLevels-1",
+            function(pc) Tarstones.DecrementAll(pc) end),
+        {
+            type = "label",
+            id = "tarReequipNote",
+            label = "",
+        },
     },
 })
 
+Give.Register()
+
 ModMenu.Register({
     id = SECTION_ADD,
-    title = "Add Amount",
+    title = "Quick Adds",
+    tab = TAB_GIVE,
+    collapsible = true,
+    collapsed = true,
     items = {
         {
             type = "label",
@@ -1082,6 +1965,8 @@ ModMenu.Register({
         AmountRow(SECTION_ADD, "gold", "Gold", "S_AddGold", function(pc, n) pc:S_AddGold(n) end, 100),
         AmountRow(SECTION_ADD, "gloom", "Gloom", "S_AddGloom", function(pc, n) pc:S_AddGloom(n) end, 100),
         AmountRow(SECTION_ADD, "glimpses", "Glimpses", "S_AddGlimpses", function(pc, n) pc:S_AddGlimpses(n) end, 100),
+        AmountRow(SECTION_ADD, "shellPoints", "Shell Points", "S_AddShellPoints",
+            function(pc, n) pc:S_AddShellPoints(n) end, 100),
         AmountRow(SECTION_ADD, "tarcores", "Tarcores", "S_AddTarcores", function(pc, n) pc:S_AddTarcores(n) end, 100),
         AmountRow(SECTION_ADD, "ventrium", "Ventrium", "S_AddVentrium", function(pc, n) pc:S_AddVentrium(n) end, 100),
         AmountRow(SECTION_ADD, "laterite", "Laterite", "S_AddLaterite", function(pc, n) pc:S_AddLaterite(n) end, 100),
@@ -1094,8 +1979,269 @@ ModMenu.Register({
 ModMenu.Register({
     id = SECTION_COMBAT,
     title = "Combat",
+    tab = TAB_CHEATS,
+    collapsible = true,
+    collapsed = true,
     items = {
-        AmountRow(SECTION_COMBAT, "heal", "Heal", "S_Heal", function(pc, n) pc:S_Heal(n) end, 100),
-        AmountRow(SECTION_COMBAT, "resolve", "Resolve", "S_GainResolve", function(pc, n) pc:S_GainResolve(n) end, 100),
+        {
+            type = "label",
+            label = "Amounts are saved. Set the number, then press Add.",
+        },
+        AmountRow(SECTION_COMBAT, "heal", "Heal", "S_Heal", function(pc, n) pc:S_Heal(n) end, CombatAmount("heal"), function(n)
+            SetCombatAmount("heal", n)
+        end),
+        AmountRow(SECTION_COMBAT, "resolve", "Resolve", "S_GainResolve", function(pc, n) pc:S_GainResolve(n) end, CombatAmount("resolve"), function(n)
+            SetCombatAmount("resolve", n)
+        end),
+        {
+            type = "button",
+            id = "breakShell",
+            label = "Break Shell",
+            onClick = function()
+                local pc = GetPlayerController()
+                if not pc then
+                    Log("Skipped: no player controller (load into a world first)")
+                    return
+                end
+                TryBreakShell(pc)
+            end,
+        },
+        PcButton("reviveShell", "Revive Player", "S_ReviveShell", function(pc) pc:S_ReviveShell() end, "primary"),
     },
 })
+
+local function FlipToggle(isOn, onFn, offFn, checkboxId)
+    local want = not isOn()
+    if checkboxId then
+        SetToggleSaved(checkboxId, want)
+    end
+    if want then
+        onFn()
+    else
+        offFn()
+    end
+    if checkboxId then
+        ModMenu.Set(SECTION_TOGGLES, checkboxId, isOn())
+    end
+end
+
+require("Keybinds").Register({
+    {
+        id = "KeybindToggles",
+        title = "Toggles",
+        hint = "Saved to config. Fires while the menu is closed. Flips Cheats → Toggles. None = off.",
+        items = {
+            {
+                id = "autoHeal",
+                label = "Auto Heal",
+                fire = function()
+                    FlipToggle(function()
+                        return autoHealOn
+                    end, AutoHealOn, AutoHealOff, "autoHeal")
+                end,
+            },
+            {
+                id = "god",
+                label = "God",
+                fire = function()
+                    FlipToggle(function()
+                        return godOn
+                    end, GodOn, GodOff, "god")
+                end,
+            },
+            {
+                id = "infiniteResolve",
+                label = "Infinite Resolve",
+                fire = function()
+                    FlipToggle(function()
+                        return infiniteResolveOn
+                    end, InfiniteResolveOn, InfiniteResolveOff, "infiniteResolve")
+                end,
+            },
+            {
+                id = "noAbilityCooldown",
+                label = "No Ability Cooldown",
+                fire = function()
+                    FlipToggle(function()
+                        return noCooldownOn
+                    end, NoCooldownOn, NoCooldownOff, "noAbilityCooldown")
+                end,
+            },
+            {
+                id = "alwaysParry",
+                label = "Auto Parry on Hit",
+                fire = function()
+                    FlipToggle(function()
+                        return alwaysParryOn
+                    end, AlwaysParryOn, AlwaysParryOff, "alwaysParry")
+                end,
+            },
+            {
+                id = "alwaysPerfectBlock",
+                label = "Always Perfect Block",
+                fire = function()
+                    FlipToggle(function()
+                        return alwaysPerfectBlockOn
+                    end, AlwaysPerfectBlockOn, AlwaysPerfectBlockOff, "alwaysPerfectBlock")
+                end,
+            },
+            {
+                id = "alwaysPerfectHarden",
+                label = "Always Perfect Harden",
+                fire = function()
+                    FlipToggle(function()
+                        return alwaysPerfectHardenOn
+                    end, AlwaysPerfectHardenOn, AlwaysPerfectHardenOff, "alwaysPerfectHarden")
+                end,
+            },
+            {
+                id = "extraMaxShellPoints",
+                label = "Max Shell Points 100",
+                fire = function()
+                    FlipToggle(function()
+                        return extraMaxShellPointsOn
+                    end, ExtraMaxShellPointsOn, ExtraMaxShellPointsOff, "extraMaxShellPoints")
+                end,
+            },
+            {
+                id = "moveFast",
+                label = "Move Fast",
+                fire = function()
+                    local want = not Character.IsMoveFast()
+                    SetToggleSaved("moveFast", want)
+                    Character.ToggleMoveFast()
+                end,
+            },
+        },
+    },
+    {
+        id = "KeybindShells",
+        title = "Shells",
+        hint = "Saved to config. Fires while the menu is closed. Flips Shells tab toggles. None = off.",
+        items = {
+            {
+                id = "fightStance",
+                label = "Smert Stealth",
+                fire = function()
+                    Character.ToggleFightStance()
+                end,
+            },
+            {
+                id = "spawnClone",
+                label = "Spawn Clone",
+                fire = function()
+                    Character.ToggleSpawnClone()
+                end,
+            },
+            {
+                id = "lazloDetonation",
+                label = "Lazlo Detonation",
+                fire = function()
+                    Character.ToggleDetonation()
+                end,
+            },
+        },
+    },
+    {
+        id = "KeybindSwitchShell",
+        title = "Switch Shell",
+        hint = "Saved to config. Fires while the menu is closed. Same as Shells → Switch Shell. None = off.",
+        items = (function()
+            local items = {}
+            local opts = Shells.Options()
+            for i = 1, #opts do
+                local id = opts[i].id
+                local label = opts[i].label
+                items[#items + 1] = {
+                    id = "switch_" .. id,
+                    label = label,
+                    fire = function()
+                        Shells.Switch(id)
+                    end,
+                }
+            end
+            return items
+        end)(),
+    },
+    {
+        id = "KeybindCombat",
+        title = "Combat",
+        hint = "Saved to config. Fires while the menu is closed. Amounts use Cheats → Combat. None = off.",
+        items = {
+            {
+                id = "heal",
+                label = "Heal",
+                fire = function()
+                    local n = tonumber(ModMenu.Get(SECTION_COMBAT, "healAmount")) or 0
+                    n = math.floor(n)
+                    if n < 1 then
+                        Log("Skipped Heal bind: amount must be >= 1")
+                        return
+                    end
+                    local pc = GetPlayerController()
+                    if not pc then
+                        Log("Skipped Heal bind: no player controller")
+                        return
+                    end
+                    local ok, err = pcall(function()
+                        pc:S_Heal(n)
+                    end)
+                    if ok then
+                        Log("Heal bind S_Heal(" .. tostring(n) .. ")")
+                    else
+                        Log("Heal bind failed — " .. tostring(err))
+                    end
+                end,
+            },
+            {
+                id = "resolve",
+                label = "Resolve",
+                fire = function()
+                    local n = tonumber(ModMenu.Get(SECTION_COMBAT, "resolveAmount")) or 0
+                    n = math.floor(n)
+                    if n < 1 then
+                        Log("Skipped Resolve bind: amount must be >= 1")
+                        return
+                    end
+                    local pc = GetPlayerController()
+                    if not pc then
+                        Log("Skipped Resolve bind: no player controller")
+                        return
+                    end
+                    local ok, err = pcall(function()
+                        pc:S_GainResolve(n)
+                    end)
+                    if ok then
+                        Log("Resolve bind S_GainResolve(" .. tostring(n) .. ")")
+                    else
+                        Log("Resolve bind failed — " .. tostring(err))
+                    end
+                end,
+            },
+            {
+                id = "reviveShell",
+                label = "Revive Player",
+                fire = function()
+                    local pc = GetPlayerController()
+                    if not pc then
+                        Log("Skipped Revive bind: no player controller")
+                        return
+                    end
+                    local ok, err = pcall(function()
+                        pc:S_ReviveShell()
+                    end)
+                    if ok then
+                        Log("Revive bind S_ReviveShell()")
+                    else
+                        Log("Revive bind failed — " .. tostring(err))
+                    end
+                end,
+            },
+        },
+    },
+})
+
+ModMenu.OnOpen(function()
+    Tarstones.RefreshStatus()
+    Give.Refresh()
+end)

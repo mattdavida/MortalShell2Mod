@@ -1,0 +1,350 @@
+================================================================================
+  Mortal Shell II Mod
+================================================================================
+In-game cheat menu for Mortal Shell II. Press F6.
+
+Five tabs: Cheats, Shells, Give, Unlocks, Keybinds. Dock left or right.
+Sections collapse so each tab stays short.
+
+Change any shell anywhere (including Harros after the prologue). Unlocks,
+give any pickup, tarstone levels, currencies, heal / resolve / revive /
+shell switch (optional hotkeys). God, Auto Heal, Infinite Resolve, no ability
+cooldowns,
+Max Shell Points 100, Auto Parry on Hit / Always Perfect Block / Perfect
+Harden, Move Fast, plus shell-specific Smert Stealth, Genessa Spawn Clone,
+and Lazlo Detonation.
+
+Requires UE4SS (latest experimental recommended) — included.
+Also requires the shared ModMenu and ConfigManager runtimes (included).
+
+Tested on UE4SS latest-experimental (UE 5.6).
+
+WARNING: Unlock buttons also fire Steam achievements. Use them only if you
+are fine with that.
+
+
+--------------------------------------------------------------------------------
+  INSTALLATION
+--------------------------------------------------------------------------------
+
+Two options — pick one.
+
+OPTION A — Full package (recommended if you do not have UE4SS yet)
+  Unzip into the game's Win64 binaries folder so UE4SS lands next to the game
+  executable:
+
+    <Mortal Shell II install>\MortalShell2\Binaries\Win64\
+
+  Steam's install folder is often named Sparta. In Steam: right-click
+  Mortal Shell II → Manage → Browse local files, then open
+  MortalShell2\Binaries\Win64\.
+
+  After extract you should see (among other UE4SS files):
+
+    ...\MortalShell2\Binaries\Win64\ue4ss\
+    ...\MortalShell2\Binaries\Win64\ue4ss\Mods\MortalShell2Mod\
+    ...\MortalShell2\Binaries\Win64\ue4ss\Mods\shared\ModMenu\
+    ...\MortalShell2\Binaries\Win64\ue4ss\Mods\shared\ConfigManager\
+    ...\MortalShell2\Binaries\Win64\ue4ss\UE4SS_Signatures\StaticConstructObject.lua
+
+OPTION B — You already have UE4SS
+  Unzip into your UE4SS Mods folder so you have:
+
+    <Mortal Shell II install>\MortalShell2\Binaries\Win64\ue4ss\Mods\MortalShell2Mod\
+    <Mortal Shell II install>\MortalShell2\Binaries\Win64\ue4ss\Mods\shared\ModMenu\
+    <Mortal Shell II install>\MortalShell2\Binaries\Win64\ue4ss\Mods\shared\ConfigManager\
+
+  Also copy the included signature if you do not already have it (needed on
+  this game):
+
+    <Mortal Shell II install>\MortalShell2\Binaries\Win64\ue4ss\UE4SS_Signatures\StaticConstructObject.lua
+
+MortalShell2Mod, shared\ModMenu, and shared\ConfigManager are all required.
+MortalShell2Mod includes an enabled.txt file so it activates automatically —
+no edits to mods.txt required.
+
+Launch the game, load into a world, press F6.
+
+
+--------------------------------------------------------------------------------
+  USAGE
+--------------------------------------------------------------------------------
+
+  F6
+      Toggle the menu. Tabs along the top: Cheats / Shells / Give / Unlocks /
+      Keybinds. Dock left or right with the Dock button. Click a section
+      header to expand or collapse it.
+
+  Heal / Resolve / Revive / toggle / shell-switch keybinds
+      Optional. Set them under the Keybinds tab. They fire while the menu
+      is closed. Heal / Resolve use the amounts from Combat. Saved to
+      Mods/MortalShell2Mod/config.json.
+
+  Laptop / compact keyboard
+      If F6 does nothing, try Fn+F6.
+
+
+--------------------------------------------------------------------------------
+  CHEATS
+--------------------------------------------------------------------------------
+
+  TOGGLES
+      Saved to config.json. Re-applied when you load into a world.
+
+  God
+      CheatManager.God — pawn cannot be damaged. Re-applied after death /
+      pawn restart while left ON. Saved to config.
+
+  Auto Heal
+      Heals you (and shell health) when below max. Amount is Character →
+      Auto Heal percent of max HP per tick (default 100%). Delay is
+      Character → Auto Heal delay (default 1s). Persists through death /
+      pawn restart while left ON.
+
+  Infinite Resolve
+      Refills Resolve when below max.
+      Persists through death / pawn restart while left ON.
+
+  No Ability Cooldown
+      Player abilities have no cooldown.
+      Persists through death / pawn restart while left ON.
+
+  Auto Parry on Hit
+      Auto-parries incoming attacks (including red / unparryable) with the
+      Infinite Seal equipped. You do not need to press parry. Saved ON
+      stays checked and retries on load. If you turn it on without the seal,
+      it unchecks and a note appears.
+
+  Always Perfect Block
+      While blocking with the Untarnished Seal, every hit is a perfect block.
+      Saved ON retries on load. Equip the seal first or a click-on unchecks.
+
+  Always Perfect Harden
+      While hardened with Vatra's Seal, every hit is a perfect harden.
+      Saved ON retries on load. Equip the seal first or a click-on unchecks.
+
+  Max Shell Points 100
+      Sets each shell's point cap to 100. Re-applies after death. Skills you
+      buy still save. Turning it off restores the original caps (bought
+      skills stay).
+
+  Move Fast
+      Multiplies Walk / Jog / Sprint on CharacterData.Movement.
+      Default x2. Change the Character dropdown while the toggle is on to
+      re-apply. Tops off every 1s if death resets speed. Toggle and
+      multiplier are saved.
+
+  CHARACTER
+      Speed multiplier for Move Fast. Auto Heal percent and delay for the
+      Auto Heal toggle. Type any percent 1–100 (23 is fine). Invalid input
+      uses 100. Speed and percent are saved to config.json. Delay is
+      session only. Off restores speed originals.
+      Re-applies after death / pawn restart.
+
+  COMBAT
+      Set the number, then press Add (default 100). Amounts are saved.
+
+  Heal
+      Heals by the entered amount.
+
+  Resolve
+      Gains Resolve by the entered amount.
+
+  Break Shell
+      Deals current shell HP as damage (S_DealDamage) so the in-game
+      shell-break path runs. Turn Auto Heal off first.
+
+  Revive Player
+      Puts you back in the shell (S_ReviveShell). Use after the shell dies
+      and you are fighting unshelled.
+
+
+--------------------------------------------------------------------------------
+  SHELLS
+--------------------------------------------------------------------------------
+
+  SWITCH SHELL
+      Change shell anywhere. Skips the shrine / pickup gate.
+      The current shell is marked (equipped). Does not learn names — do that
+      in-game if you want the lore.
+
+  Harros, the Vassal
+      Prologue shell. Restored even after the Tar Golem fight petrifies him.
+
+  Tiel, the Acolyte
+  Eredrim, the Venerable
+  Proxima, the Broodseer
+  Gragu, the Insatiable
+  Smert, the Apostate
+  Genessa, the Wayward
+  Lazlo, the Justicar
+  Sariel, the Endless
+
+  Dark Form
+      ActivateDarkForm (keep anims playing, reinit pose). Success is an
+      out bool.
+
+  SHELL TOGGLES
+      Shell-specific. Session only. Equip the matching shell first.
+      Re-apply after death / pawn restart.
+
+  Smert Stealth
+      EnableFightStance on / RemovePermanentFightStance off. Weapons stay
+      out. Smert must be equipped or the toggle unchecks.
+
+  Spawn Clone
+      Spawns Genessa's left and right astral clones. Genessa must be
+      equipped. Session only.
+
+  Lazlo Detonation
+      Fires Lazlo's last shockwave on a loop. Lazlo must be equipped or
+      the toggle unchecks. Shockwave delay (0.5s–5s, default 3s) only
+      shows while Lazlo is selected.
+
+
+--------------------------------------------------------------------------------
+  KEYBINDS
+--------------------------------------------------------------------------------
+
+  Saved across launches (config.json next to the mod). Fires while the menu
+  is closed. None = off.
+  F6 and mouse buttons cannot be bound.
+  Sections collapse; Toggles starts open, Shells / Switch Shell / Combat start
+  closed.
+
+  TOGGLES
+      One dropdown per Cheats → Toggles checkbox. The key flips that toggle
+      on or off. Seal toggles still uncheck if the seal is not equipped.
+
+  SHELLS
+      Smert Stealth / Spawn Clone / Lazlo Detonation. Same as Shells →
+      Shell Toggles.
+
+  SWITCH SHELL
+      One dropdown per Shells → Switch Shell button (nine shells + Dark Form).
+      Same as clicking that button. Load into a world first.
+
+  COMBAT
+      Heal / Resolve fire the Combat amounts (they are not toggles).
+      Revive Player fires S_ReviveShell (same as Cheats → Combat).
+
+
+--------------------------------------------------------------------------------
+  GIVE
+--------------------------------------------------------------------------------
+
+  TARSTONES
+
+  Add All Tarstones (Melee / Support / Sidearm)
+      Adds all tarstones of that type. The button flashes green briefly.
+
+  Increment All Tarstone Levels
+      Raises every tarstone you currently have by one (UI 1 → 2 → 3).
+      Max is 3. After a change, a short note reminds you to re-equip so the
+      new effects apply.
+
+  Decrement All Tarstone Levels
+      Lowers every tarstone you currently have by one (UI 3 → 2 → 1).
+      Re-equip after changing levels to refresh effects.
+
+  GIVE ITEM
+
+  Item
+      Searchable list of pickups. Type to filter, pick one, set Amount
+      (defaults to 1; resets to 1 when you pick a different item), then Add.
+      Load into a world first so the pickup table can load.
+
+  Give All Items
+      Behind a collapsed header at the bottom of Give Item (after Add),
+      so it is not one click away. Adds every item.
+
+  QUICK ADDS
+      Set the number, then press Add (default 100).
+
+  Gold / Gloom / Glimpses / Shell Points / Tarcores / Ventrium / Laterite /
+  Dorsalite / Thoracium / Ovums
+
+
+--------------------------------------------------------------------------------
+  UNLOCKS
+--------------------------------------------------------------------------------
+      Steam achievements unlock with these. Load into a world first.
+      Each unlock flashes green briefly and shows a short Done note.
+
+  UNLOCKS
+
+  Unlock All Clothing
+  Unlock All Gates
+  Unlock All Landing Areas
+  Unlock All Masks
+  Unlock All Seals
+  Unlock All Shells
+      Unlocks shells and world pickups. Does not learn names.
+  Unlock All Sidearms
+  Unlock All Weapons
+  Unlock Shell Shades
+  Unlock Red Harbinger
+  Unlock Cosmic Harbinger
+  Unlock Dark Form Shades
+
+  MAP
+
+  Unlock Map
+      Fills the map.
+
+  Unlock Fast Travel
+
+  Reveal All Icons
+      Paints every icon and autosaves — cannot undo.
+
+
+--------------------------------------------------------------------------------
+  NOTES
+--------------------------------------------------------------------------------
+
+  - Load into a world first. Buttons do nothing on the title / menu screens
+    (they need a live player controller).
+
+  - Unlock buttons fire Steam achievements. There is no "Unlock Everything"
+    on purpose — that spammed achievement notifications.
+
+  - God / Auto Heal / Infinite Resolve / No Ability Cooldown / Auto Parry on Hit /
+    Always Perfect Block / Always Perfect Harden / Max Shell Points 100 /
+    Move Fast re-apply after death / pawn restart (~3 s). Move Fast also
+    tops off every 1s if speed was reset.
+
+  - Seal toggles need the matching seal equipped (Infinite / Untarnished /
+    Vatra's). A click-on without the seal unchecks. Saved ON stays checked
+    and retries when you load a world; a note shows until the ability is
+    ready. If you swap seals, turn the toggle off and on again. Perfect
+    Block can hook on equip; parry and harden often need that retoggle.
+
+  - Smert Stealth / Spawn Clone / Lazlo Detonation need that shell equipped.
+    If the ability is not loaded, the checkbox turns itself off.
+
+  - Cheats → Toggles, keybinds, speed multiplier, Auto Heal percent, and
+    Combat amounts are saved to config.json. Shell toggles (Smert / Genessa /
+    Lazlo) are still session only. Restart the game with a toggle off to
+    leave it off next time.
+
+  - Keybinds do not fire while the F6 menu is open. Close the menu, then
+    press the bound key. Heal / Resolve amounts always come from Combat.
+
+  - After increment / decrement tarstone levels, re-equip the stones or the
+    UI / effects can look stale (especially at level 3).
+
+  - This game needs the included StaticConstructObject.lua signature under
+    ue4ss\UE4SS_Signatures\ or UE4SS may fail to start.
+
+
+--------------------------------------------------------------------------------
+  CREDITS
+--------------------------------------------------------------------------------
+
+  RE-UE4SS
+      https://github.com/UE4SS-RE/RE-UE4SS
+
+  ue4ss-ModMenu
+      https://github.com/mattdavida/ue4ss-ModMenu
+
+================================================================================

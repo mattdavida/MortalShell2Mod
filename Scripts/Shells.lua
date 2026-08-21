@@ -1,6 +1,10 @@
 --[[
-  Shell picker — same layout as OutfitCheatMod:
-  one button per shell, current one tagged " (equipped)".
+  Shell picker and current-shell helpers.
+
+  Own tab (next to Cheats): one button per shell, current one tagged
+  " (equipped)". Smert / Genessa / Lazlo toggles live in Character.lua
+  on the same tab. Delay dropdown for Lazlo is shown only while Lazlo
+  is the current shell.
 ]]
 
 local UEHelpers = require("UEHelpers.UEHelpers")
@@ -12,22 +16,34 @@ local SECTION_ID = "Shells"
 
 --- Official nine shells. Harros is prologue-only and needs the petrified flag cleared.
 local SHELLS = {
-    { id = "harros",  label = "Harros, the Vassal",     name = "Harros",  restore = true },
+    { id = "harros",  label = "Harros, the Vassal",     name = "Harros", restore = true },
     { id = "tiel",    label = "Tiel, the Acolyte",      name = "Tiel" },
     { id = "eredrim", label = "Eredrim, the Venerable", name = "Eredrim" },
-    { id = "proxima", label = "Proxima, the Broodseer", name = "Proxima",
-      aliases = { "Broodseer", "Broodseeker", "BroodSeeker" } },
-    { id = "gragu",   label = "Gragu, the Insatiable",  name = "Gragu" },
-    { id = "smert",   label = "Smert, the Apostate",    name = "Smert" },
-    { id = "genessa", label = "Genessa, the Wayward",   name = "Genessa" },
-    { id = "lazlo",   label = "Lazlo, the Justicar",    name = "Lazlo" },
-    { id = "sariel",  label = "Sariel, the Endless",    name = "Sariel" },
+    {
+        id = "proxima",
+        label = "Proxima, the Broodseer",
+        name = "Proxima",
+        aliases = { "Broodseer", "Broodseeker", "BroodSeeker" }
+    },
+    { id = "gragu",   label = "Gragu, the Insatiable", name = "Gragu" },
+    { id = "smert",   label = "Smert, the Apostate",   name = "Smert" },
+    { id = "genessa", label = "Genessa, the Wayward",  name = "Genessa" },
+    { id = "lazlo",   label = "Lazlo, the Justicar",   name = "Lazlo" },
+    { id = "sariel",  label = "Sariel, the Endless",   name = "Sariel" },
 }
 
 local currentName = nil
 --- Last shell the player picked in this menu. Nil until they click.
 local wantedName = nil
 local reapplyHandle = nil
+---@type fun(current: string|nil)[]
+local changedFns = {}
+
+local function NotifyChanged()
+    for i = 1, #changedFns do
+        pcall(changedFns[i], currentName)
+    end
+end
 
 local function IsValid(obj)
     return obj ~= nil and type(obj.IsValid) == "function" and obj:IsValid()
@@ -461,6 +477,7 @@ local function EquipShell(pc, shell)
     end
     RefreshShellLabels()
     Log("Equipped " .. shell.label)
+    NotifyChanged()
 end
 
 local function ReapplyWantedShell()
@@ -480,6 +497,90 @@ local function ReapplyWantedShell()
     end
     EquipShell(pc, shell)
     Log("Re-applied " .. shell.label .. " after restart")
+end
+
+---@param id string
+---@return boolean
+function M.Is(id)
+    if type(id) ~= "string" or id == "" then
+        return false
+    end
+    for i = 1, #SHELLS do
+        if SHELLS[i].id == id then
+            return MatchesShell(SHELLS[i], currentName)
+        end
+    end
+    return false
+end
+
+---@param fn fun(current: string|nil)
+function M.OnChanged(fn)
+    if type(fn) == "function" then
+        changedFns[#changedFns + 1] = fn
+    end
+end
+
+local function RefreshFromWorld()
+    local pc = GetPlayerController()
+    if not pc then
+        return
+    end
+    local detected = DetectCurrentShell(pc)
+    if detected then
+        currentName = detected
+        RefreshShellLabels()
+        NotifyChanged()
+    end
+end
+
+---@param pc APlayerController
+---@return boolean
+local function ActivateDarkForm(pc)
+    local success = { true }
+    local ok, err = pcall(function()
+        pc:ActivateDarkForm(false, true, success)
+    end)
+    if ok then
+        Log("Dark Form: ActivateDarkForm(false, true) success=" .. tostring(success[1]))
+        wantedName = nil
+        ExecuteInGameThreadWithDelay(300, RefreshFromWorld)
+        return true
+    end
+    Log("Dark Form: ActivateDarkForm failed — " .. tostring(err))
+    return false
+end
+
+--- Nine shells plus Dark Form, same order as Switch Shell.
+---@return { id: string, label: string }[]
+function M.Options()
+    local list = {}
+    for i = 1, #SHELLS do
+        list[#list + 1] = { id = SHELLS[i].id, label = SHELLS[i].label }
+    end
+    list[#list + 1] = { id = "darkForm", label = "Dark Form" }
+    return list
+end
+
+---@param id string
+---@return boolean
+function M.Switch(id)
+    local pc = GetPlayerController()
+    if not pc then
+        Log("Skipped: no player controller (load into a world first)")
+        return false
+    end
+    if id == "darkForm" then
+        return ActivateDarkForm(pc)
+    end
+    for i = 1, #SHELLS do
+        local shell = SHELLS[i]
+        if shell.id == id then
+            EquipShell(pc, shell)
+            return true
+        end
+    end
+    Log("Switch: unknown shell " .. tostring(id))
+    return false
 end
 
 function M.Register()
@@ -506,21 +607,35 @@ function M.Register()
             id = ShellButtonId(shell),
             label = label,
             onClick = function()
-                local controller = GetPlayerController()
-                if not controller then
-                    Log("Skipped: no player controller (load into a world first)")
-                    return
-                end
-                EquipShell(controller, shell)
+                M.Switch(shell.id)
             end,
         }
     end
 
+    items[#items + 1] = { type = "separator" }
+    items[#items + 1] = {
+        type = "button",
+        id = "darkForm",
+        label = "Dark Form",
+        onClick = function()
+            M.Switch("darkForm")
+        end,
+    }
+
     ModMenu.Register({
         id = SECTION_ID,
-        title = "Shells",
+        title = "Switch Shell",
+        tab = "Shells",
+        collapsible = true,
+        collapsed = false,
         items = items,
     })
+
+    NotifyChanged()
+
+    ModMenu.OnOpen(function()
+        RefreshFromWorld()
+    end)
 
     RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
         if wantedName == nil then
@@ -530,7 +645,7 @@ function M.Register()
             pcall(CancelDelayedAction, reapplyHandle)
             reapplyHandle = nil
         end
-        reapplyHandle = ExecuteInGameThreadWithDelay(300, function()
+        reapplyHandle = ExecuteInGameThreadWithDelay(3000, function()
             reapplyHandle = nil
             ReapplyWantedShell()
         end)
