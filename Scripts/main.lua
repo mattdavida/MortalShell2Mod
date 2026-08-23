@@ -22,6 +22,7 @@ ConfigManager.Init({
         combat = {
             heal = 100,
             resolve = 100,
+            damagePct = "50",
         },
         toggles = {
             autoHeal = false,
@@ -62,7 +63,6 @@ print("--------------------------------")
 local SECTION_TOGGLES = "Toggles"
 local SECTION_UNLOCKS = "Unlocks"
 local SECTION_MAP = "Map"
-local SECTION_ITEMS = "Tarstones"
 local SECTION_ADD = "Add"
 local SECTION_COMBAT = "Combat"
 
@@ -219,36 +219,81 @@ local function GetHealthComponent(pc)
     return nil
 end
 
---- Deal current shell HP so OnShellHealthDepleted can run (same path as a hit).
+--- Damage the current bar (shell if worn, flesh if unshelled). Never empty
+--- the shell — S_DealDamage hits shell first, and anything >= current shell
+--- HP fires OnShellHealthDepleted.
+---@param hc USpartaHealthComponent
+---@return number|nil current
+---@return number|nil max
+---@return string|nil pool
+local function ReadDamagePool(hc)
+    if not IsValid(hc) then
+        return nil, nil, nil
+    end
+    local shell = nil
+    local maxShell = nil
+    pcall(function()
+        shell = tonumber(hc:GetShellHealth())
+    end)
+    pcall(function()
+        maxShell = tonumber(hc:GetMaxShellHealth())
+    end)
+    if shell ~= nil and maxShell ~= nil and maxShell > 0 and shell > 0.5 then
+        return shell, maxShell, "shell"
+    end
+    local health = nil
+    local maxH = nil
+    pcall(function()
+        health = tonumber(hc:GetHealth())
+    end)
+    pcall(function()
+        maxH = tonumber(hc:GetCurrentMaxHealth())
+    end)
+    if maxH == nil or maxH <= 0 then
+        pcall(function()
+            maxH = tonumber(hc:GetMaxHealth())
+        end)
+    end
+    if health == nil or maxH == nil or maxH <= 0 then
+        return nil, nil, nil
+    end
+    return health, maxH, "flesh"
+end
+
 ---@param pc APlayerController
+---@param pct number
 ---@return boolean
-local function TryBreakShell(pc)
+local function TryDamagePlayer(pc, pct)
     local hc = GetHealthComponent(pc)
     if not IsValid(hc) then
-        Log("Break Shell: no health component")
+        Log("Damage: no health component")
         return false
     end
-    local okRead, shellHp = pcall(function()
-        return hc:GetShellHealth()
-    end)
-    shellHp = okRead and tonumber(shellHp) or nil
-    if shellHp == nil then
-        Log("Break Shell: could not read shell health")
+    local current, maxH, pool = ReadDamagePool(hc)
+    if current == nil or maxH == nil or pool == nil then
+        Log("Damage: could not read health")
         return false
     end
-    if shellHp <= 0.5 then
-        Log("Break Shell: shell health already empty (" .. tostring(shellHp) .. ")")
-        return false
+    local target = maxH * (pct / 100)
+    if target < 1 then
+        target = 1
     end
-    local amount = shellHp + 1
+    if current <= target + 0.5 then
+        Log(string.format("Damage: %s already %.0f%% or below (%.1f / %.1f)", pool, pct, current, maxH))
+        return true
+    end
+    local amount = current - target
+    if pool == "shell" and amount >= current then
+        amount = current - 1
+    end
     local ok, err = pcall(function()
         pc:S_DealDamage(amount)
     end)
     if not ok then
-        Log("Break Shell: S_DealDamage failed - " .. tostring(err))
+        Log("Damage: S_DealDamage failed - " .. tostring(err))
         return false
     end
-    Log(string.format("Break Shell: S_DealDamage(%.1f) shell was %.1f", amount, shellHp))
+    Log(string.format("Damage: S_DealDamage(%.1f) %s %.1f -> %.0f%% of %.1f", amount, pool, current, pct, maxH))
     return true
 end
 
@@ -1080,16 +1125,104 @@ end
 
 --- Blueprint abilities are not loaded until a pawn exists.
 --- Register on ClientRestart; UnregisterHook first so restarts do not stack.
+--- FindFirstOf can hit the CDO too early — hook that and combat still uses a
+--- later live instance. Wait for a non-Default__ object, prefer the player pawn.
+
+---@param obj UObject
+---@return string|nil
+local function ObjectFullName(obj)
+    if not IsValid(obj) then
+        return nil
+    end
+    local name = nil
+    pcall(function()
+        name = obj:GetFullName()
+    end)
+    if type(name) == "string" and name ~= "" then
+        return name
+    end
+    return nil
+end
+
+---@param obj UObject
+---@return boolean
+local function IsDefaultObject(obj)
+    local name = ObjectFullName(obj)
+    return type(name) == "string" and name:find("Default__", 1, true) ~= nil
+end
+
+---@param obj UObject
+---@param target UObject
+---@return boolean
+local function OuterChainHas(obj, target)
+    if not IsValid(obj) or not IsValid(target) then
+        return false
+    end
+    local targetAddr = ObjectAddress(target)
+    local cur = obj
+    for _ = 1, 8 do
+        if not IsValid(cur) then
+            return false
+        end
+        if cur == target then
+            return true
+        end
+        local addr = ObjectAddress(cur)
+        if targetAddr ~= nil and addr ~= nil and addr == targetAddr then
+            return true
+        end
+        local ok, outer = pcall(function()
+            if type(cur.GetOuter) == "function" then
+                return cur:GetOuter()
+            end
+            return cur.Outer
+        end)
+        if not ok or outer == nil then
+            return false
+        end
+        cur = outer
+    end
+    return false
+end
+
+---@param classPath string
+---@return UObject|nil
+local function FindLiveAbility(classPath)
+    local name = classPath:match("([^./]+)$")
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    local pawn = GetPlayerPawn()
+    local list = nil
+    pcall(function()
+        list = FindAllOf(name)
+    end)
+    local fallback = nil
+    if type(list) == "table" then
+        for i = 1, #list do
+            local obj = list[i]
+            if IsValid(obj) and not IsDefaultObject(obj) then
+                if pawn ~= nil and OuterChainHas(obj, pawn) then
+                    return obj
+                end
+                if fallback == nil then
+                    fallback = obj
+                end
+            end
+        end
+        return fallback
+    end
+    local obj = FindFirstOf(name)
+    if IsValid(obj) and not IsDefaultObject(obj) then
+        return obj
+    end
+    return nil
+end
 
 ---@param classPath string
 ---@return boolean
 local function BlueprintClassLoaded(classPath)
-    local name = classPath:match("([^./]+)$")
-    if type(name) ~= "string" or name == "" then
-        return false
-    end
-    local obj = FindFirstOf(name)
-    return IsValid(obj)
+    return FindLiveAbility(classPath) ~= nil
 end
 
 ---@param state { prefix: string, classPath: string, isOn: fun(): boolean, entries: table }
@@ -1098,10 +1231,16 @@ local function UnhookBlueprintBool(state, entry)
     if entry.preId == nil and entry.postId == nil then
         return
     end
-    local path = state.classPath .. ":" .. entry.name
-    local ok, err = pcall(UnregisterHook, path, entry.preId, entry.postId)
-    if not ok then
-        Log(state.prefix .. ": unhook failed " .. entry.name .. " — " .. tostring(err))
+    -- ClientRestart often destroys the UFunction first; skip unregister then.
+    if BlueprintClassLoaded(state.classPath) then
+        local path = state.classPath .. ":" .. entry.name
+        local ok, err = pcall(UnregisterHook, path, entry.preId, entry.postId)
+        if not ok then
+            local msg = tostring(err)
+            if not string.find(msg, "no UFunction", 1, true) then
+                Log(state.prefix .. ": unhook failed " .. entry.name .. " — " .. msg)
+            end
+        end
     end
     entry.preId = nil
     entry.postId = nil
@@ -1142,6 +1281,29 @@ local function EnsureBlueprintBoolHooks(state)
         end
     end
     return n == #state.entries
+end
+
+---@param state { entries: table }
+---@return boolean
+local function SealHooksReady(state)
+    if state == nil or type(state.entries) ~= "table" or #state.entries == 0 then
+        return false
+    end
+    for i = 1, #state.entries do
+        if state.entries[i].preId == nil then
+            return false
+        end
+    end
+    return true
+end
+
+---@param state { prefix: string, classPath: string, isOn: fun(): boolean, entries: table }
+local function InvalidateBlueprintHooks(state)
+    for i = 1, #state.entries do
+        state.entries[i].preId = nil
+        state.entries[i].postId = nil
+    end
+    state.waitingLogged = nil
 end
 
 local parryHookState = {
@@ -1272,34 +1434,109 @@ local function SetToggleSaved(id, on)
     ConfigManager.Set("toggles", t)
 end
 
---- Keep saved intent on if the ability is not loaded yet (retry after ClientRestart).
+--- Keep saved intent on if the ability is not loaded yet (retry until live).
 ---@param state table
 ---@param checkboxId string
 ---@param noteId string
 ---@param failNote string
+---@return boolean
 local function ReapplySealToggle(state, checkboxId, noteId, failNote)
+    if SealHooksReady(state) then
+        SetSealToggleUi(true, checkboxId, noteId, "")
+        return true
+    end
+    if not GetPlayerPawn() then
+        return false
+    end
+    if not BlueprintClassLoaded(state.classPath) then
+        SetSealToggleUi(true, checkboxId, noteId, "Waiting for ability…")
+        if not state.waitingLogged then
+            state.waitingLogged = true
+            Log(state.prefix .. ": waiting — ability not loaded yet")
+        end
+        return false
+    end
+    if EnsureBlueprintBoolHooks(state) then
+        state.waitingLogged = nil
+        SetSealToggleUi(true, checkboxId, noteId, "")
+        Log(state.prefix .. ": ON")
+        return true
+    end
+    SetSealToggleUi(true, checkboxId, noteId, failNote)
+    if not state.waitingLogged then
+        state.waitingLogged = true
+        Log(state.prefix .. ": waiting — hook failed")
+    end
+    return false
+end
+
+local SEAL_RETRY_MS = 1000
+local sealRetryHandle = nil
+local restartReapplyHandle = nil
+
+local function CancelSealRetry()
+    if sealRetryHandle then
+        pcall(CancelDelayedAction, sealRetryHandle)
+        sealRetryHandle = nil
+    end
+end
+
+local function SealToggleNeedsRetry()
+    if alwaysParryOn and not SealHooksReady(parryHookState) then
+        return true
+    end
+    if alwaysPerfectBlockOn and not SealHooksReady(perfectBlockHookState) then
+        return true
+    end
+    if alwaysPerfectHardenOn and not SealHooksReady(perfectHardenHookState) then
+        return true
+    end
+    return false
+end
+
+local function TickSealRetries()
     if not GetPlayerPawn() then
         return
     end
-    if not BlueprintClassLoaded(state.classPath) then
-        SetSealToggleUi(true, checkboxId, noteId, failNote)
-        Log(state.prefix .. ": waiting — " .. failNote)
+    if alwaysParryOn and not SealHooksReady(parryHookState) then
+        ReapplySealToggle(parryHookState, "alwaysParry", "alwaysParryNote", PARRY_SEAL_NOTE)
+    end
+    if alwaysPerfectBlockOn and not SealHooksReady(perfectBlockHookState) then
+        ReapplySealToggle(perfectBlockHookState, "alwaysPerfectBlock", "alwaysPerfectBlockNote", BLOCK_SEAL_NOTE)
+    end
+    if alwaysPerfectHardenOn and not SealHooksReady(perfectHardenHookState) then
+        ReapplySealToggle(perfectHardenHookState, "alwaysPerfectHarden", "alwaysPerfectHardenNote", HARDEN_SEAL_NOTE)
+    end
+    if not SealToggleNeedsRetry() then
+        CancelSealRetry()
+    end
+end
+
+local function EnsureSealRetryTick()
+    if not SealToggleNeedsRetry() then
+        CancelSealRetry()
         return
     end
-    if EnsureBlueprintBoolHooks(state) then
-        SetSealToggleUi(true, checkboxId, noteId, "")
-        Log(state.prefix .. ": ON")
+    if sealRetryHandle then
         return
     end
-    SetSealToggleUi(true, checkboxId, noteId, failNote)
-    Log(state.prefix .. ": waiting — " .. failNote)
+    sealRetryHandle = LoopInGameThreadWithDelay(SEAL_RETRY_MS, TickSealRetries)
 end
 
 local function ReapplyTogglesAfterRestart()
     InvalidatePlayerCache()
     CancelTick()
     CancelCooldownTick()
-    ExecuteInGameThreadWithDelay(RESTART_DELAY_MS, function()
+    InvalidateBlueprintHooks(parryHookState)
+    InvalidateBlueprintHooks(perfectBlockHookState)
+    InvalidateBlueprintHooks(perfectHardenHookState)
+    if restartReapplyHandle then
+        pcall(CancelDelayedAction, restartReapplyHandle)
+        restartReapplyHandle = nil
+    end
+    EnsureSealRetryTick()
+    restartReapplyHandle = ExecuteInGameThreadWithDelay(RESTART_DELAY_MS, function()
+        restartReapplyHandle = nil
         InvalidatePlayerCache()
         if alwaysParryOn then
             ReapplySealToggle(parryHookState, "alwaysParry", "alwaysParryNote", PARRY_SEAL_NOTE)
@@ -1310,6 +1547,7 @@ local function ReapplyTogglesAfterRestart()
         if alwaysPerfectHardenOn then
             ReapplySealToggle(perfectHardenHookState, "alwaysPerfectHarden", "alwaysPerfectHardenNote", HARDEN_SEAL_NOTE)
         end
+        EnsureSealRetryTick()
         if extraMaxShellPointsOn then
             ApplyStartingMaxShellPoints(false)
         end
@@ -1518,7 +1756,6 @@ local toastHandles = {}
 local TOAST_ID = {
     [SECTION_UNLOCKS] = "unlockToast",
     [SECTION_MAP] = "mapToast",
-    [SECTION_ITEMS] = "tarAddToast",
 }
 
 ---@param key string
@@ -1569,13 +1806,14 @@ local function FlashUnlockFeedback(sectionId, itemId, restoreVariant, ok, captio
     end
 end
 
-local function PcButton(id, label, name, call, variant, sectionId)
+local function PcButton(id, label, name, call, variant, sectionId, confirm)
     local restore = variant or "default"
     return {
         type = "button",
         id = id,
         label = label,
         variant = variant,
+        confirm = confirm,
         onClick = function()
             local ok = CallOnPlayerController(name, call)
             if sectionId then
@@ -1584,6 +1822,16 @@ local function PcButton(id, label, name, call, variant, sectionId)
         end,
     }
 end
+
+local function BulkConfirm(label, message)
+    return {
+        title = label .. "?",
+        message = message,
+        confirmLabel = label,
+    }
+end
+
+local ACHIEVE_CONFIRM = "Steam achievements unlock with this. Load into a world first."
 
 ---@param className string
 ---@return UObject|nil
@@ -1799,6 +2047,55 @@ local function SetCombatAmount(field, n)
     ConfigManager.Set("combat", combat)
 end
 
+local DAMAGE_PCT_DEFAULT = "50"
+local DAMAGE_PCT_OPTIONS = {
+    { label = "50%", value = "50" },
+    { label = "40%", value = "40" },
+    { label = "35%", value = "35" },
+    { label = "25%", value = "25" },
+    { label = "10%", value = "10" },
+    { label = "1%", value = "1" },
+}
+
+---@return string
+local function SavedDamagePct()
+    local combat = ConfigManager.Get("combat")
+    local v = ""
+    if type(combat) == "table" then
+        v = tostring(combat.damagePct or combat.breakPct or "")
+    end
+    for i = 1, #DAMAGE_PCT_OPTIONS do
+        if DAMAGE_PCT_OPTIONS[i].value == v then
+            return v
+        end
+    end
+    return DAMAGE_PCT_DEFAULT
+end
+
+---@param value any
+local function SetDamagePct(value)
+    local combat = ConfigManager.Get("combat")
+    if type(combat) ~= "table" then
+        combat = {}
+    end
+    combat.damagePct = tostring(value or DAMAGE_PCT_DEFAULT)
+    combat.breakPct = nil
+    ConfigManager.Set("combat", combat)
+end
+
+---@return number
+local function SelectedDamagePct()
+    local v = tostring(ModMenu.Get(SECTION_COMBAT, "damagePct") or "")
+    local n = tonumber(v) or tonumber(SavedDamagePct())
+    if n == nil or n ~= n or n <= 0 then
+        n = tonumber(DAMAGE_PCT_DEFAULT) or 50
+    end
+    if n > 100 then
+        n = 100
+    end
+    return n
+end
+
 --- Row: integer amount field + Add button. Reads ModMenu.Get(sectionId, amountId).
 ---@param sectionId string
 ---@param id string
@@ -1807,7 +2104,8 @@ end
 ---@param callWithAmount fun(pc: APlayerController, n: integer)
 ---@param default integer|nil
 ---@param onAmountChange fun(n: integer)|nil
-local function AmountRow(sectionId, id, label, name, callWithAmount, default, onAmountChange)
+---@param confirm table|nil { title?: string, message: string, confirmLabel?: string }
+local function AmountRow(sectionId, id, label, name, callWithAmount, default, onAmountChange, confirm)
     local amountId = id .. "Amount"
     return {
         type = "row",
@@ -1844,9 +2142,21 @@ local function AmountRow(sectionId, id, label, name, callWithAmount, default, on
                         Log("Skipped: " .. name .. " amount must be >= 1")
                         return
                     end
-                    CallOnPlayerController(string.format("%s(%d)", name, n), function(pc)
-                        callWithAmount(pc, n)
-                    end)
+                    local function grant()
+                        CallOnPlayerController(string.format("%s(%d)", name, n), function(pc)
+                            callWithAmount(pc, n)
+                        end)
+                    end
+                    if type(confirm) == "table" then
+                        ModMenu.Confirm({
+                            title = confirm.title or string.format("Add %d %s?", n, string.lower(label)),
+                            message = confirm.message,
+                            confirmLabel = confirm.confirmLabel or "Add",
+                            onConfirm = grant,
+                        })
+                        return
+                    end
+                    grant()
                 end,
             },
         },
@@ -1865,23 +2175,35 @@ ModMenu.Register({
             label = "Steam achievements unlock with these. Load into a world first.",
         },
         { type = "separator" },
-        PcButton("clothing", "Unlock All Clothing", "S_UnlockAllClothing", function(pc) pc:S_UnlockAllClothing() end, nil, SECTION_UNLOCKS),
-        PcButton("gates", "Unlock All Gates", "S_UnlockAllGates", function(pc) pc:S_UnlockAllGates() end, nil, SECTION_UNLOCKS),
+        PcButton("clothing", "Unlock All Clothing", "S_UnlockAllClothing", function(pc) pc:S_UnlockAllClothing() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Clothing", ACHIEVE_CONFIRM)),
+        PcButton("gates", "Unlock All Gates", "S_UnlockAllGates", function(pc) pc:S_UnlockAllGates() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Gates", ACHIEVE_CONFIRM)),
         PcButton("landing", "Unlock All Landing Areas", "S_UnlockAllLandingAreas",
-            function(pc) pc:S_UnlockAllLandingAreas() end, nil, SECTION_UNLOCKS),
-        PcButton("masks", "Unlock All Masks", "S_UnlockAllMasks", function(pc) pc:S_UnlockAllMasks() end, nil, SECTION_UNLOCKS),
-        PcButton("seals", "Unlock All Seals", "S_UnlockAllSeals", function(pc) pc:S_UnlockAllSeals() end, nil, SECTION_UNLOCKS),
-        PcButton("shells", "Unlock All Shells", "UnlockAllShells", UnlockAllShellsThorough, nil, SECTION_UNLOCKS),
-        PcButton("sidearms", "Unlock All Sidearms", "S_UnlockAllSidearms", function(pc) pc:S_UnlockAllSidearms() end, nil, SECTION_UNLOCKS),
-        PcButton("weapons", "Unlock All Weapons", "S_UnlockAllWeapons", function(pc) pc:S_UnlockAllWeapons() end, nil, SECTION_UNLOCKS),
+            function(pc) pc:S_UnlockAllLandingAreas() end, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock All Landing Areas", ACHIEVE_CONFIRM)),
+        PcButton("masks", "Unlock All Masks", "S_UnlockAllMasks", function(pc) pc:S_UnlockAllMasks() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Masks", ACHIEVE_CONFIRM)),
+        PcButton("seals", "Unlock All Seals", "S_UnlockAllSeals", function(pc) pc:S_UnlockAllSeals() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Seals", ACHIEVE_CONFIRM)),
+        PcButton("shells", "Unlock All Shells", "UnlockAllShells", UnlockAllShellsThorough, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock All Shells", ACHIEVE_CONFIRM)),
+        PcButton("sidearms", "Unlock All Sidearms", "S_UnlockAllSidearms", function(pc) pc:S_UnlockAllSidearms() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Sidearms", ACHIEVE_CONFIRM)),
+        PcButton("weapons", "Unlock All Weapons", "S_UnlockAllWeapons", function(pc) pc:S_UnlockAllWeapons() end, nil,
+            SECTION_UNLOCKS, BulkConfirm("Unlock All Weapons", ACHIEVE_CONFIRM)),
         PcButton("shellShades", "Unlock Shell Shades", "S_UnlockShellShades",
-            function(pc) pc:S_UnlockShellShades() end, nil, SECTION_UNLOCKS),
+            function(pc) pc:S_UnlockShellShades() end, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock Shell Shades", ACHIEVE_CONFIRM)),
         PcButton("red", "Unlock Red Harbinger", "S_UnlockRedHarbinger",
-            function(pc) pc:S_UnlockRedHarbinger() end, nil, SECTION_UNLOCKS),
+            function(pc) pc:S_UnlockRedHarbinger() end, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock Red Harbinger", ACHIEVE_CONFIRM)),
         PcButton("cosmic", "Unlock Cosmic Harbinger", "S_UnlockCosmicHarbinger",
-            function(pc) pc:S_UnlockCosmicHarbinger() end, nil, SECTION_UNLOCKS),
+            function(pc) pc:S_UnlockCosmicHarbinger() end, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock Cosmic Harbinger", ACHIEVE_CONFIRM)),
         PcButton("darkShades", "Unlock Dark Form Shades", "S_UnlockDarkFormShades",
-            function(pc) pc:S_UnlockDarkFormShades() end, nil, SECTION_UNLOCKS),
+            function(pc) pc:S_UnlockDarkFormShades() end, nil, SECTION_UNLOCKS,
+            BulkConfirm("Unlock Dark Form Shades", ACHIEVE_CONFIRM)),
         {
             type = "label",
             id = "unlockToast",
@@ -1901,11 +2223,13 @@ ModMenu.Register({
             type = "label",
             label = "Unlock Map fills the map. Reveal All paints every icon and autosaves — cannot undo.",
         },
-        PcButton("unlockMap", "Unlock Map", "S_UnlockMap", function(pc) pc:S_UnlockMap() end, "primary", SECTION_MAP),
+        PcButton("unlockMap", "Unlock Map", "S_UnlockMap", function(pc) pc:S_UnlockMap() end, "primary", SECTION_MAP,
+            BulkConfirm("Unlock Map", "Fills the map. Load into a world first.")),
         PcButton("fastTravel", "Unlock Fast Travel", "S_UnlockFastTravel",
             function(pc) pc:S_UnlockFastTravel() end, nil, SECTION_MAP),
         PcButton("revealAll", "Reveal All Icons", "S_MapReveal_All",
-            function(pc) pc:S_MapReveal_All() end, "warning", SECTION_MAP),
+            function(pc) pc:S_MapReveal_All() end, nil, SECTION_MAP,
+            BulkConfirm("Reveal All Icons", "Paints every icon and autosaves. This cannot be undone.")),
         {
             type = "label",
             id = "mapToast",
@@ -1914,40 +2238,7 @@ ModMenu.Register({
     },
 })
 
-ModMenu.Register({
-    id = SECTION_ITEMS,
-    title = "Tarstones",
-    tab = TAB_GIVE,
-    collapsible = true,
-    collapsed = true,
-    items = {
-        PcButton("tarMelee", "Add All Tarstones (Melee)", "S_AddAllTarstonesMelee",
-            function(pc) pc:S_AddAllTarstonesMelee() end, nil, SECTION_ITEMS),
-        PcButton("tarSupport", "Add All Tarstones (Support)", "S_AddAllTarstonesSupport",
-            function(pc) pc:S_AddAllTarstonesSupport() end, nil, SECTION_ITEMS),
-        PcButton("tarSidearm", "Add All Tarstones (Sidearm)", "S_AddAllTarstonesSidearm",
-            function(pc) pc:S_AddAllTarstonesSidearm() end, nil, SECTION_ITEMS),
-        {
-            type = "label",
-            id = "tarAddToast",
-            label = "",
-        },
-        {
-            type = "label",
-            id = "tarLevelStatus",
-            label = "Tarstone level: 1 / 3",
-        },
-        PcButton("tarLevel", "Increment All Tarstone Levels", "TarstoneLevels+1",
-            function(pc) Tarstones.IncrementAll(pc) end),
-        PcButton("tarLevelDown", "Decrement All Tarstone Levels", "TarstoneLevels-1",
-            function(pc) Tarstones.DecrementAll(pc) end),
-        {
-            type = "label",
-            id = "tarReequipNote",
-            label = "",
-        },
-    },
-})
+Tarstones.Register()
 
 Give.Register()
 
@@ -1972,7 +2263,9 @@ ModMenu.Register({
         AmountRow(SECTION_ADD, "laterite", "Laterite", "S_AddLaterite", function(pc, n) pc:S_AddLaterite(n) end, 100),
         AmountRow(SECTION_ADD, "dorsalite", "Dorsalite", "S_AddDorsalite", function(pc, n) pc:S_AddDorsalite(n) end, 100),
         AmountRow(SECTION_ADD, "thoracium", "Thoracium", "S_AddThoracium", function(pc, n) pc:S_AddThoracium(n) end, 100),
-        AmountRow(SECTION_ADD, "ovums", "Ovums", "S_AddOvums", function(pc, n) pc:S_AddOvums(n) end, 100),
+        AmountRow(SECTION_ADD, "ovums", "Ovums", "S_AddOvums", function(pc, n) pc:S_AddOvums(n) end, 100, nil, {
+            confirmLabel = "Add",
+        }),
     },
 })
 
@@ -1985,28 +2278,40 @@ ModMenu.Register({
     items = {
         {
             type = "label",
-            label = "Amounts are saved. Set the number, then press Add.",
+            label = "Amounts and Damage to are saved. Set the number, then press Add.",
         },
-        AmountRow(SECTION_COMBAT, "heal", "Heal", "S_Heal", function(pc, n) pc:S_Heal(n) end, CombatAmount("heal"), function(n)
-            SetCombatAmount("heal", n)
-        end),
-        AmountRow(SECTION_COMBAT, "resolve", "Resolve", "S_GainResolve", function(pc, n) pc:S_GainResolve(n) end, CombatAmount("resolve"), function(n)
-            SetCombatAmount("resolve", n)
-        end),
+        PcButton("reviveShell", "Revive Player", "S_ReviveShell", function(pc) pc:S_ReviveShell() end, "primary"),
+        AmountRow(SECTION_COMBAT, "heal", "Heal", "S_Heal", function(pc, n) pc:S_Heal(n) end, CombatAmount("heal"),
+            function(n)
+                SetCombatAmount("heal", n)
+            end),
+        AmountRow(SECTION_COMBAT, "resolve", "Resolve", "S_GainResolve", function(pc, n) pc:S_GainResolve(n) end,
+            CombatAmount("resolve"), function(n)
+                SetCombatAmount("resolve", n)
+            end),
+        {
+            type = "dropdown",
+            id = "damagePct",
+            label = "Damage to",
+            options = DAMAGE_PCT_OPTIONS,
+            default = SavedDamagePct(),
+            onChange = function(value)
+                SetDamagePct(value)
+            end,
+        },
         {
             type = "button",
-            id = "breakShell",
-            label = "Break Shell",
+            id = "damagePlayer",
+            label = "Damage Player",
             onClick = function()
                 local pc = GetPlayerController()
                 if not pc then
                     Log("Skipped: no player controller (load into a world first)")
                     return
                 end
-                TryBreakShell(pc)
+                TryDamagePlayer(pc, SelectedDamagePct())
             end,
         },
-        PcButton("reviveShell", "Revive Player", "S_ReviveShell", function(pc) pc:S_ReviveShell() end, "primary"),
     },
 })
 
@@ -2166,8 +2471,27 @@ require("Keybinds").Register({
     {
         id = "KeybindCombat",
         title = "Combat",
-        hint = "Saved to config. Fires while the menu is closed. Amounts use Cheats → Combat. None = off.",
+        hint = "Saved to config. Fires while the menu is closed. Amounts and Damage to use Cheats → Combat. None = off.",
         items = {
+            {
+                id = "reviveShell",
+                label = "Revive Player",
+                fire = function()
+                    local pc = GetPlayerController()
+                    if not pc then
+                        Log("Skipped Revive bind: no player controller")
+                        return
+                    end
+                    local ok, err = pcall(function()
+                        pc:S_ReviveShell()
+                    end)
+                    if ok then
+                        Log("Revive bind S_ReviveShell()")
+                    else
+                        Log("Revive bind failed — " .. tostring(err))
+                    end
+                end,
+            },
             {
                 id = "heal",
                 label = "Heal",
@@ -2219,22 +2543,15 @@ require("Keybinds").Register({
                 end,
             },
             {
-                id = "reviveShell",
-                label = "Revive Player",
+                id = "damagePlayer",
+                label = "Damage Player",
                 fire = function()
                     local pc = GetPlayerController()
                     if not pc then
-                        Log("Skipped Revive bind: no player controller")
+                        Log("Skipped Damage bind: no player controller")
                         return
                     end
-                    local ok, err = pcall(function()
-                        pc:S_ReviveShell()
-                    end)
-                    if ok then
-                        Log("Revive bind S_ReviveShell()")
-                    else
-                        Log("Revive bind failed — " .. tostring(err))
-                    end
+                    TryDamagePlayer(pc, SelectedDamagePct())
                 end,
             },
         },
@@ -2242,6 +2559,6 @@ require("Keybinds").Register({
 })
 
 ModMenu.OnOpen(function()
-    Tarstones.RefreshStatus()
+    Tarstones.Refresh()
     Give.Refresh()
 end)

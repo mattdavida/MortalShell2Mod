@@ -1,10 +1,14 @@
 --[[
   Shell picker and current-shell helpers.
 
-  Own tab (next to Cheats): one button per shell, current one tagged
-  " (equipped)". Smert / Genessa / Lazlo toggles live in Character.lua
-  on the same tab. Delay dropdown for Lazlo is shown only while Lazlo
-  is the current shell.
+  Catalog comes from SpartaGameSettings (Shells + GetShellNames), not a
+  hardcoded English name list. Labels use ItemFragment_Display.
+  Switch uses the ShellNames FString (S_SwitchToShell / GetShellItemDefinition).
+  Equipped state uses GetCurrentShellID class/tag, not HUD FText.
+
+  Skip ID_Shell_LoadFromSave. Harros still clears the petrified flag.
+  Smert / Genessa / Lazlo toggles live in Character.lua. Lazlo is
+  ID_Shell_Necrophage — Is("lazlo") keys off GetShellNames, not the class.
 ]]
 
 local UEHelpers = require("UEHelpers.UEHelpers")
@@ -13,35 +17,44 @@ local ModMenu = require("ModMenu.ModMenu")
 local M = {}
 
 local SECTION_ID = "Shells"
+local SETTINGS_CDO = "/Script/Sparta.Default__SpartaGameSettings"
+local ITEM_LIB_CDO = "/Script/Sparta.Default__SpartaItemFunctionLibrary"
+local DISPLAY_FRAG = "/Script/Sparta.ItemFragment_Display"
+local DARK_FORM_ID = "darkForm"
+local DARK_FORM_LABEL = "Dark Form"
 
---- Official nine shells. Harros is prologue-only and needs the petrified flag cleared.
-local SHELLS = {
-    { id = "harros",  label = "Harros, the Vassal",     name = "Harros", restore = true },
-    { id = "tiel",    label = "Tiel, the Acolyte",      name = "Tiel" },
-    { id = "eredrim", label = "Eredrim, the Venerable", name = "Eredrim" },
-    {
-        id = "proxima",
-        label = "Proxima, the Broodseer",
-        name = "Proxima",
-        aliases = { "Broodseer", "Broodseeker", "BroodSeeker" }
-    },
-    { id = "gragu",   label = "Gragu, the Insatiable", name = "Gragu" },
-    { id = "smert",   label = "Smert, the Apostate",   name = "Smert" },
-    { id = "genessa", label = "Genessa, the Wayward",  name = "Genessa" },
-    { id = "lazlo",   label = "Lazlo, the Justicar",   name = "Lazlo" },
-    { id = "sariel",  label = "Sariel, the Endless",   name = "Sariel" },
+--- Last-resort switch keys (same strings as GetShellNames). Not UI titles.
+local FALLBACK_SHELLS = {
+    { id = "tiel",    name = "Tiel",    label = "Tiel" },
+    { id = "lazlo",   name = "Lazlo",   label = "Lazlo" },
+    { id = "genessa", name = "Genessa", label = "Genessa" },
+    { id = "smert",   name = "Smert",   label = "Smert" },
+    { id = "harros",  name = "Harros",  label = "Harros", restore = true },
+    { id = "eredrim", name = "Eredrim", label = "Eredrim" },
+    { id = "sariel",  name = "Sariel",  label = "Sariel" },
+    { id = "gragu",   name = "Gragu",   label = "Gragu" },
+    { id = "proxima", name = "Proxima", label = "Proxima" },
+    { id = "solomon", name = "Solomon", label = "Solomon" },
 }
 
-local currentName = nil
---- Last shell the player picked in this menu. Nil until they click.
+--- Filled by LoadCatalog. Each: id, name, label, path, restore.
+local SHELLS = {}
+
+--- Stable catalog id of the equipped shell (lazlo, harros, ...).
+local currentId = nil
+--- Last shell the player picked in this menu. Switch key (GetShellNames).
 local wantedName = nil
 local reapplyHandle = nil
+local registeredCount = -1
+local skipFrag = false
+local cachedItemLib = nil
+local cachedDisplayFragClass = nil
 ---@type fun(current: string|nil)[]
 local changedFns = {}
 
 local function NotifyChanged()
     for i = 1, #changedFns do
-        pcall(changedFns[i], currentName)
+        pcall(changedFns[i], currentId)
     end
 end
 
@@ -89,14 +102,56 @@ local function WriteField(obj, field, value)
     end)
 end
 
+--- TArray wrappers only. Do not probe `.get` on UE structs — GameplayTag
+--- __index treats Get as a property and errors (pcall does not catch it).
+local function IsUnrealParam(value)
+    if value == nil then
+        return false
+    end
+    local t = type(value)
+    if t == "RemoteUnrealParam" or t == "LocalUnrealParam" then
+        return true
+    end
+    local text = nil
+    pcall(function()
+        text = tostring(value)
+    end)
+    return type(text) == "string" and text:find("^RemoteUnrealParam", 1) ~= nil
+end
+
+---@param param any
+---@return any
+local function UnwrapParam(param)
+    local value = param
+    for _ = 1, 3 do
+        if value == nil or not IsUnrealParam(value) then
+            return value
+        end
+        local ok, inner = pcall(function()
+            return value:get()
+        end)
+        if not ok or inner == nil or inner == value then
+            return value
+        end
+        value = inner
+    end
+    return value
+end
+
 ---@param value any
 ---@return string|nil
 local function ToLuaString(value)
+    value = UnwrapParam(value)
     if value == nil then
         return nil
     end
     if type(value) == "string" then
-        if value:find("^table:", 1) or value == "" or value == "None" or value == "nil" then
+        if value:find("^table:", 1)
+            or value:find("^RemoteUnrealParam", 1)
+            or value == ""
+            or value == "None"
+            or value == "nil"
+        then
             return nil
         end
         return value
@@ -128,6 +183,13 @@ local function ToLuaString(value)
             return tagName
         end
     end
+    if type(value) == "boolean" then
+        return nil
+    end
+    local text = tostring(value)
+    if text ~= nil and text ~= "" and text ~= "nil" and not text:find("^table:", 1) then
+        return text
+    end
     return nil
 end
 
@@ -138,7 +200,7 @@ local function TagToString(tag)
 end
 
 ---@param arr any
----@param fn fun(item: any)
+---@param fn fun(item: any, index: integer)
 local function ForEachArrayItem(arr, fn)
     if arr == nil then
         return
@@ -147,21 +209,26 @@ local function ForEachArrayItem(arr, fn)
     pcall(function()
         n = #arr
     end)
+    if n == 0 then
+        pcall(function()
+            n = arr:GetArrayNum()
+        end)
+    end
     if n > 0 then
         for i = 1, n do
             local ok, item = pcall(function()
                 return arr[i]
             end)
             if ok then
-                fn(item)
+                fn(UnwrapParam(item), i)
             end
         end
         return
     end
     pcall(function()
-        for _, item in ipairs(arr) do
-            fn(item)
-        end
+        arr:ForEach(function(index, elem)
+            fn(UnwrapParam(elem), index)
+        end)
     end)
 end
 
@@ -208,14 +275,249 @@ local function AlnumLower(text)
     return (string.lower(text):gsub("[^%w]+", ""))
 end
 
+local function GetItemLib()
+    if IsValid(cachedItemLib) then
+        return cachedItemLib
+    end
+    cachedItemLib = nil
+    pcall(function()
+        cachedItemLib = StaticFindObject(ITEM_LIB_CDO)
+    end)
+    if IsValid(cachedItemLib) then
+        return cachedItemLib
+    end
+    cachedItemLib = nil
+    return nil
+end
+
+local function GetDisplayFragClass()
+    if IsValid(cachedDisplayFragClass) then
+        return cachedDisplayFragClass
+    end
+    cachedDisplayFragClass = nil
+    pcall(function()
+        cachedDisplayFragClass = StaticFindObject(DISPLAY_FRAG)
+    end)
+    if IsValid(cachedDisplayFragClass) then
+        return cachedDisplayFragClass
+    end
+    cachedDisplayFragClass = nil
+    return nil
+end
+
+--- HUD name is on ItemFragment_Display. Only :ToString() — no Kismet loc APIs.
+local function FragmentDisplayName(itemClass)
+    if skipFrag or itemClass == nil then
+        return nil
+    end
+    local lib = GetItemLib()
+    local fragClass = GetDisplayFragClass()
+    if not IsValid(lib) or not IsValid(fragClass) then
+        return nil
+    end
+    local frag = nil
+    local ok, err = pcall(function()
+        frag = lib:FindItemDefinitionFragment(itemClass, fragClass)
+    end)
+    if not ok then
+        skipFrag = true
+        Log("Shells: skip display fragment — " .. tostring(err))
+        return nil
+    end
+    if not IsValid(frag) then
+        return nil
+    end
+    return ToLuaString(frag.DisplayName)
+end
+
+local function CdoDisplayName(itemClass)
+    if itemClass == nil then
+        return nil
+    end
+    local def = itemClass
+    pcall(function()
+        if itemClass.GetCDO then
+            def = itemClass:GetCDO()
+        elseif itemClass.GetDefaultObject then
+            def = itemClass:GetDefaultObject()
+        end
+    end)
+    if not IsValid(def) then
+        return nil
+    end
+    return ToLuaString(def.DisplayName)
+end
+
+local function ClassDisplayName(itemClass)
+    local name = FragmentDisplayName(itemClass)
+    if name ~= nil then
+        return name
+    end
+    return CdoDisplayName(itemClass)
+end
+
+---@return UObject|nil
+local function GetGameSettings()
+    local settings = nil
+    pcall(function()
+        settings = StaticFindObject(SETTINGS_CDO)
+    end)
+    if not IsValid(settings) then
+        settings = FindFirstOf("SpartaGameSettings")
+    end
+    if not IsValid(settings) then
+        return nil
+    end
+    pcall(function()
+        local inst = settings:Get()
+        if IsValid(inst) then
+            settings = inst
+        end
+    end)
+    return settings
+end
+
+---@param value any
+---@return string|nil
+local function SoftPath(value)
+    if value == nil then
+        return nil
+    end
+    if type(value) == "userdata" or type(value) == "table" then
+        if type(value.get) == "function" then
+            local ok, inner = pcall(function()
+                return value:get()
+            end)
+            if ok and inner ~= nil and inner ~= value then
+                local nested = SoftPath(inner)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+        for _, field in ipairs({ "AssetPathName", "AssetPath", "ObjectPath", "SoftObjectPath" }) do
+            local ok, fieldVal = pcall(function()
+                return value[field]
+            end)
+            if ok and fieldVal ~= nil then
+                local nested = SoftPath(fieldVal)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+    end
+    local text = ToLuaString(value)
+    if text == nil then
+        return nil
+    end
+    local path = text:match("(/Game/[^%s,\"']+)") or text:match("(/Script/[^%s,\"']+)")
+    if path ~= nil then
+        return (path:gsub("[%.]+$", ""))
+    end
+    if text:find("^/Game/", 1) or text:find("^/Script/", 1) then
+        return text
+    end
+    return nil
+end
+
+local function ObjectName(obj)
+    if obj == nil then
+        return nil
+    end
+    local name = nil
+    pcall(function()
+        if obj.GetName then
+            name = obj:GetName()
+        end
+    end)
+    name = ToLuaString(name)
+    if name ~= nil then
+        return name
+    end
+    local full = nil
+    pcall(function()
+        if obj.GetFullName then
+            full = obj:GetFullName()
+        end
+    end)
+    return ToLuaString(full)
+end
+
+local function FindClass(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local obj = nil
+    pcall(function()
+        obj = StaticFindObject(path)
+    end)
+    if IsValid(obj) then
+        return obj
+    end
+    return nil
+end
+
+local function ShouldSkip(name, path)
+    local blob = AlnumLower((name or "") .. (path or ""))
+    return blob:find("loadfromsave", 1, true) ~= nil
+end
+
+local function IsHarros(name, path)
+    local blob = AlnumLower((name or "") .. (path or ""))
+    return blob:find("harros", 1, true) ~= nil
+end
+
+local function MakeId(name, path)
+    if type(name) == "string" and name ~= "" then
+        local id = AlnumLower(name)
+        if id ~= "" then
+            return id
+        end
+    end
+    if type(path) == "string" then
+        local base = path:match("([^/%.]+)_C$") or path:match("([^/%.]+)$")
+        if base ~= nil then
+            base = base:gsub("^ID_Shell_", "")
+            local id = AlnumLower(base)
+            if id ~= "" then
+                return id
+            end
+        end
+    end
+    return nil
+end
+
+---@param path string|nil
+---@return string[]
+local function PathTokens(path)
+    local tokens = {}
+    if type(path) ~= "string" or path == "" then
+        return tokens
+    end
+    local base = path:match("([^/%.]+)$") or path
+    tokens[#tokens + 1] = base
+    local noC = base:gsub("_C$", "")
+    if noC ~= base then
+        tokens[#tokens + 1] = noC
+    end
+    local short = noC:gsub("^ID_Shell_", "")
+    if short ~= noC then
+        tokens[#tokens + 1] = short
+    end
+    return tokens
+end
+
 ---@param shell table
 ---@return string[]
 local function ShellTokens(shell)
     local tokens = { shell.name, shell.id }
-    if shell.aliases then
-        for i = 1, #shell.aliases do
-            tokens[#tokens + 1] = shell.aliases[i]
-        end
+    if shell.label ~= nil and shell.label ~= shell.name then
+        tokens[#tokens + 1] = shell.label
+    end
+    local extras = PathTokens(shell.path)
+    for i = 1, #extras do
+        tokens[#tokens + 1] = extras[i]
     end
     return tokens
 end
@@ -232,13 +534,15 @@ local function MatchesShell(shell, current)
     last = last:match("([^,%s]+)") or last
     local compact = AlnumLower(current)
     for _, token in ipairs(ShellTokens(shell)) do
-        local needle = string.lower(token)
-        if needle ~= "" and (last == needle or c:find(needle, 1, true)) then
-            return true
-        end
-        local compactNeedle = AlnumLower(token)
-        if compactNeedle ~= "" and compact:find(compactNeedle, 1, true) then
-            return true
+        if type(token) == "string" and token ~= "" then
+            local needle = string.lower(token)
+            if last == needle or c:find(needle, 1, true) then
+                return true
+            end
+            local compactNeedle = AlnumLower(token)
+            if compactNeedle ~= "" and compact:find(compactNeedle, 1, true) then
+                return true
+            end
         end
     end
     return false
@@ -253,26 +557,171 @@ local function ShellByName(name)
     return nil
 end
 
+local function ShellById(id)
+    if type(id) ~= "string" or id == "" then
+        return nil
+    end
+    for i = 1, #SHELLS do
+        if SHELLS[i].id == id then
+            return SHELLS[i]
+        end
+    end
+    return nil
+end
+
+local function CollectStrings(arr)
+    local list = {}
+    ForEachArrayItem(arr, function(item)
+        local text = ToLuaString(item)
+        if text ~= nil then
+            list[#list + 1] = text
+        else
+            list[#list + 1] = ""
+        end
+    end)
+    return list
+end
+
+local function CollectPaths(arr)
+    local list = {}
+    ForEachArrayItem(arr, function(item)
+        list[#list + 1] = SoftPath(item) or ""
+    end)
+    return list
+end
+
+local function ResolveLabel(name, path, settings)
+    local item = nil
+    if settings ~= nil and type(name) == "string" and name ~= "" then
+        pcall(function()
+            item = settings:GetShellItemDefinition(name)
+        end)
+    end
+    if not IsValid(item) then
+        item = FindClass(path)
+    end
+    if IsValid(item) then
+        local display = ClassDisplayName(item)
+        if display ~= nil then
+            return display
+        end
+    end
+    return name
+end
+
+local function UseFallback(reason)
+    if #SHELLS > 0 then
+        return
+    end
+    local copy = {}
+    for i = 1, #FALLBACK_SHELLS do
+        local src = FALLBACK_SHELLS[i]
+        copy[i] = {
+            id = src.id,
+            name = src.name,
+            label = src.label,
+            restore = src.restore,
+        }
+    end
+    SHELLS = copy
+    Log("Shells: " .. reason)
+end
+
+local function LoadCatalog()
+    local settings = GetGameSettings()
+    if settings == nil then
+        UseFallback("settings missing — using switch-key fallback")
+        return
+    end
+
+    local names = {}
+    pcall(function()
+        names = CollectStrings(settings:GetShellNames())
+    end)
+    if #names == 0 then
+        names = CollectStrings(ReadField(settings, "ShellNames"))
+    end
+    local paths = CollectPaths(ReadField(settings, "Shells"))
+
+    local n = math.max(#names, #paths)
+    if n == 0 then
+        UseFallback("catalog empty — using switch-key fallback")
+        return
+    end
+
+    local list = {}
+    local skipped = 0
+    for i = 1, n do
+        local name = names[i]
+        if name == "" then
+            name = nil
+        end
+        local path = paths[i]
+        if path == "" then
+            path = nil
+        end
+        if ShouldSkip(name, path) then
+            skipped = skipped + 1
+        else
+            local id = MakeId(name, path)
+            if id ~= nil then
+                local label = ResolveLabel(name, path, settings) or name or id
+                list[#list + 1] = {
+                    id = id,
+                    name = name or id,
+                    label = label,
+                    path = path,
+                    restore = IsHarros(name, path),
+                }
+            end
+        end
+    end
+
+    if #list == 0 then
+        UseFallback("no playable shells — using switch-key fallback")
+        return
+    end
+
+    SHELLS = list
+    Log(string.format("Shells: catalog %d (skipped %d LoadFromSave)", #SHELLS, skipped))
+end
+
+local function ButtonLabel(shell)
+    local label = shell.label or shell.name or shell.id
+    if currentId ~= nil and currentId == shell.id then
+        return label .. "  (equipped)"
+    end
+    return label
+end
+
 local function RefreshShellLabels()
     for i = 1, #SHELLS do
         local shell = SHELLS[i]
-        local label = shell.label
-        if MatchesShell(shell, currentName) then
-            label = label .. "  (equipped)"
+        pcall(function()
+            ModMenu.SetButtonLabel(SECTION_ID, ShellButtonId(shell), ButtonLabel(shell))
+        end)
+    end
+end
+
+local function AddCandidate(candidates, value)
+    if type(value) == "userdata" or type(value) == "table" then
+        local name = ObjectName(value)
+        if name ~= nil then
+            candidates[#candidates + 1] = name
         end
-        ModMenu.SetButtonLabel(SECTION_ID, ShellButtonId(shell), label)
+    end
+    local text = TagToString(value) or ToLuaString(value)
+    if text and text ~= "" then
+        candidates[#candidates + 1] = text
     end
 end
 
 ---@param pc APlayerController
----@return string|nil, string[]
+---@return table|nil, string[]
 local function DetectCurrentShell(pc)
     local candidates = {}
     local function add(value)
-        local text = TagToString(value) or ToLuaString(value)
-        if text and text ~= "" then
-            candidates[#candidates + 1] = text
-        end
+        AddCandidate(candidates, value)
     end
 
     local pawn = pc.Pawn
@@ -293,6 +742,24 @@ local function DetectCurrentShell(pc)
         end)
     end
 
+    local playerFl = FindCdo("BPFL_Player_C")
+    if IsValid(playerFl) then
+        local ok, a, b, c, d, e = pcall(function()
+            return playerFl:GetCurrentShellID(pc)
+        end)
+        if ok then
+            add(a)
+            add(b)
+            add(c)
+            add(d)
+            add(e)
+        end
+    end
+
+    pcall(function()
+        add(pc:GetCurrentShell())
+    end)
+
     local ui = FindCdo("BPFL_UI_C")
     if IsValid(ui) then
         local ok, name = pcall(function()
@@ -303,9 +770,11 @@ local function DetectCurrentShell(pc)
         end
     end
 
-    for i = 1, #candidates do
-        if ShellByName(candidates[i]) then
-            return candidates[i], candidates
+    for i = 1, #SHELLS do
+        for c = 1, #candidates do
+            if MatchesShell(SHELLS[i], candidates[c]) then
+                return SHELLS[i], candidates
+            end
         end
     end
     return nil, candidates
@@ -437,14 +906,8 @@ local function EquipShell(pc, shell)
 
     UnlockMatchingTags(pc, shell)
 
-    local game = FindCdo("SpartaGameSettings")
+    local game = GetGameSettings()
     if IsValid(game) then
-        pcall(function()
-            local inst = game:Get()
-            if IsValid(inst) then
-                game = inst
-            end
-        end)
         local ok, item = pcall(function()
             return game:GetShellItemDefinition(shell.name)
         end)
@@ -469,14 +932,13 @@ local function EquipShell(pc, shell)
     end)
 
     wantedName = shell.name
-    -- Trust the click for the label. Proxima's id is not always "Proxima".
-    currentName = shell.name
+    currentId = shell.id
     local detected = DetectCurrentShell(pc)
-    if detected and MatchesShell(shell, detected) then
-        currentName = detected
+    if detected ~= nil then
+        currentId = detected.id
     end
     RefreshShellLabels()
-    Log("Equipped " .. shell.label)
+    Log("Equipped " .. (shell.label or shell.name))
     NotifyChanged()
 end
 
@@ -496,7 +958,7 @@ local function ReapplyWantedShell()
         return
     end
     EquipShell(pc, shell)
-    Log("Re-applied " .. shell.label .. " after restart")
+    Log("Re-applied " .. (shell.label or shell.name) .. " after restart")
 end
 
 ---@param id string
@@ -505,12 +967,7 @@ function M.Is(id)
     if type(id) ~= "string" or id == "" then
         return false
     end
-    for i = 1, #SHELLS do
-        if SHELLS[i].id == id then
-            return MatchesShell(SHELLS[i], currentName)
-        end
-    end
-    return false
+    return currentId == id
 end
 
 ---@param fn fun(current: string|nil)
@@ -527,7 +984,7 @@ local function RefreshFromWorld()
     end
     local detected = DetectCurrentShell(pc)
     if detected then
-        currentName = detected
+        currentId = detected.id
         RefreshShellLabels()
         NotifyChanged()
     end
@@ -543,6 +1000,9 @@ local function ActivateDarkForm(pc)
     if ok then
         Log("Dark Form: ActivateDarkForm(false, true) success=" .. tostring(success[1]))
         wantedName = nil
+        currentId = DARK_FORM_ID
+        RefreshShellLabels()
+        NotifyChanged()
         ExecuteInGameThreadWithDelay(300, RefreshFromWorld)
         return true
     end
@@ -550,14 +1010,17 @@ local function ActivateDarkForm(pc)
     return false
 end
 
---- Nine shells plus Dark Form, same order as Switch Shell.
+--- Playable shells plus Dark Form, same order as Switch Shell.
 ---@return { id: string, label: string }[]
 function M.Options()
+    if #SHELLS == 0 then
+        LoadCatalog()
+    end
     local list = {}
     for i = 1, #SHELLS do
         list[#list + 1] = { id = SHELLS[i].id, label = SHELLS[i].label }
     end
-    list[#list + 1] = { id = "darkForm", label = "Dark Form" }
+    list[#list + 1] = { id = DARK_FORM_ID, label = DARK_FORM_LABEL }
     return list
 end
 
@@ -569,71 +1032,92 @@ function M.Switch(id)
         Log("Skipped: no player controller (load into a world first)")
         return false
     end
-    if id == "darkForm" then
+    if id == DARK_FORM_ID then
         return ActivateDarkForm(pc)
     end
-    for i = 1, #SHELLS do
-        local shell = SHELLS[i]
-        if shell.id == id then
-            EquipShell(pc, shell)
-            return true
-        end
+    if #SHELLS == 0 then
+        LoadCatalog()
+    end
+    local shell = ShellById(id)
+    if shell ~= nil then
+        EquipShell(pc, shell)
+        return true
     end
     Log("Switch: unknown shell " .. tostring(id))
     return false
 end
 
-function M.Register()
-    local pc = GetPlayerController()
-    if pc then
-        currentName = DetectCurrentShell(pc)
-        if currentName then
-            Log("Current shell: " .. currentName)
-        end
-    end
-
+local function BuildItems()
     local items = {
         { type = "label", label = "S_SwitchToShell — skips the shrine gate." },
     }
-
+    if #SHELLS == 0 then
+        items[#items + 1] = {
+            type = "label",
+            label = "Shell list not loaded — open the menu in a world.",
+        }
+    end
     for i = 1, #SHELLS do
         local shell = SHELLS[i]
-        local label = shell.label
-        if MatchesShell(shell, currentName) then
-            label = label .. "  (equipped)"
-        end
         items[#items + 1] = {
             type = "button",
             id = ShellButtonId(shell),
-            label = label,
+            label = ButtonLabel(shell),
             onClick = function()
                 M.Switch(shell.id)
             end,
         }
     end
-
     items[#items + 1] = { type = "separator" }
     items[#items + 1] = {
         type = "button",
-        id = "darkForm",
-        label = "Dark Form",
+        id = DARK_FORM_ID,
+        label = DARK_FORM_LABEL,
         onClick = function()
-            M.Switch("darkForm")
+            M.Switch(DARK_FORM_ID)
         end,
     }
+    return items
+end
 
+local function RegisterSection()
     ModMenu.Register({
         id = SECTION_ID,
         title = "Switch Shell",
         tab = "Shells",
         collapsible = true,
         collapsed = false,
-        items = items,
+        items = BuildItems(),
     })
+    registeredCount = #SHELLS
+end
 
+function M.Register()
+    LoadCatalog()
+
+    local pc = GetPlayerController()
+    if pc then
+        local detected = DetectCurrentShell(pc)
+        if detected then
+            currentId = detected.id
+            Log("Current shell: " .. (detected.label or detected.name))
+        end
+    end
+
+    RegisterSection()
     NotifyChanged()
 
     ModMenu.OnOpen(function()
+        local before = #SHELLS
+        LoadCatalog()
+        if #SHELLS ~= registeredCount then
+            RegisterSection()
+        else
+            RefreshShellLabels()
+        end
+        if before == 0 and #SHELLS > 0 then
+            Log(string.format("Shells: loaded %d after menu open", #SHELLS))
+        end
         RefreshFromWorld()
     end)
 

@@ -4,7 +4,8 @@
   Category stays Pickup for now (no dropdown until more catalogs exist).
   Labels prefer ItemFragment_Display:ToString (HUD field), then CDO.
   Never call Kismet FText / loc-table APIs (native crash).
-  Grant via S_AddItemQuantity.
+  Grant via S_AddItemQuantity. Remove via RemoveItemStacksSilent
+  (pawn ItemManager), not by writing FSpartaItemList.Entries.
 ]]
 
 local UEHelpers = require("UEHelpers.UEHelpers")
@@ -17,8 +18,10 @@ local CATEGORY_PICKUP = "Pickup"
 local DT_PICKUP = "/Game/Sparta/Items/Pickups/Core/DT_PickUpItems.DT_PickUpItems"
 local NONE = "__none__"
 local UTIL_CDO = "Default__BPFL_Utility_C"
+local PLAYER_LIB_CDO = "Default__BPFL_Player_C"
 local AMOUNT_ID = "giveAmount"
 local DEFAULT_AMOUNT = 1
+local FLASH_MS = 300
 
 local NOT_READY = "Pickup table not loaded — open the menu in a world."
 
@@ -42,9 +45,30 @@ local state = {
 }
 
 local cachedUtil = nil
+local cachedPlayerLib = nil
 local cachedItemLib = nil
 local cachedDisplayFragClass = nil
 local skipFrag = false
+local buttonFlashHandles = {}
+
+local function FlashFeedback(itemId, ok)
+    local flashKey = SECTION_ID .. ":" .. itemId
+    local handle = buttonFlashHandles[flashKey]
+    if handle then
+        pcall(CancelDelayedAction, handle)
+        buttonFlashHandles[flashKey] = nil
+    end
+    local flashVariant = ok and "success" or "danger"
+    pcall(function()
+        ModMenu.SetButtonVariant(SECTION_ID, itemId, flashVariant)
+    end)
+    buttonFlashHandles[flashKey] = ExecuteInGameThreadWithDelay(FLASH_MS, function()
+        buttonFlashHandles[flashKey] = nil
+        pcall(function()
+            ModMenu.SetButtonVariant(SECTION_ID, itemId, "default")
+        end)
+    end)
+end
 
 local ITEM_LIB_CDO = "/Script/Sparta.Default__SpartaItemFunctionLibrary"
 local DISPLAY_FRAG = "/Script/Sparta.ItemFragment_Display"
@@ -119,6 +143,21 @@ local function GetUtility()
     return nil
 end
 
+local function GetPlayerLib()
+    if IsValid(cachedPlayerLib) then
+        return cachedPlayerLib
+    end
+    cachedPlayerLib = nil
+    pcall(function()
+        cachedPlayerLib = FindObject(nil, PLAYER_LIB_CDO)
+    end)
+    if IsValid(cachedPlayerLib) then
+        return cachedPlayerLib
+    end
+    cachedPlayerLib = nil
+    return nil
+end
+
 local function GetItemLib()
     if IsValid(cachedItemLib) then
         return cachedItemLib
@@ -159,6 +198,103 @@ local function GetWorldCtx()
         return world
     end
     return nil
+end
+
+local function GetPawn()
+    local pc = UEHelpers.GetPlayerController()
+    if not IsValid(pc) then
+        return nil, nil
+    end
+    local pawn = pc.Pawn
+    if not IsValid(pawn) then
+        return pc, nil
+    end
+    return pc, pawn
+end
+
+--- Lives on the pawn. The inventory widget only caches a view of this.
+local function GetItemManager(pawn)
+    if IsValid(pawn) then
+        local mgr = pawn.ItemManagerComponent
+        if IsValid(mgr) then
+            return mgr
+        end
+    end
+    return nil
+end
+
+local function FindRowSoftClass(id)
+    local dt = StaticFindObject(DT_PICKUP)
+    if not IsValid(dt) then
+        return nil
+    end
+    local row = nil
+    pcall(function()
+        row = dt:FindRow(id)
+    end)
+    if row == nil then
+        return nil
+    end
+    return row.ItemClass
+end
+
+local function ResolveRowClass(id)
+    local soft = FindRowSoftClass(id)
+    if soft == nil then
+        return nil
+    end
+    local util = GetUtility()
+    local world = GetWorldCtx()
+    if not IsValid(util) or not IsValid(world) then
+        return nil
+    end
+    local cls = nil
+    pcall(function()
+        cls = util:ResolveSoftItemDefinition(soft, world)
+    end)
+    if IsValid(cls) then
+        return cls
+    end
+    return nil
+end
+
+local function RefreshInventoryWidgets()
+    pcall(function()
+        local widgets = FindAllOf("WBP_Player_Inventory_C")
+        if widgets == nil then
+            return
+        end
+        for i = 1, #widgets do
+            local w = widgets[i]
+            if IsValid(w) and w.Refresh then
+                w:Refresh()
+            end
+        end
+    end)
+end
+
+local function SelectedItemId()
+    local id = state.itemId
+    if id == nil or id == "" then
+        id = ModMenu.Get(SECTION_ID, "item")
+    end
+    return AsString(id)
+end
+
+local function SelectedAmount()
+    local n = tonumber(ModMenu.Get(SECTION_ID, AMOUNT_ID)) or 0
+    return math.floor(n)
+end
+
+local function ItemLabel(id)
+    local opts = ItemOptions()
+    for i = 1, #opts do
+        local opt = opts[i]
+        if opt ~= nil and opt.value == id then
+            return opt.label or id
+        end
+    end
+    return id
 end
 
 --- HUD name is on ItemFragment_Display. CDO DisplayName is a different FText.
@@ -368,26 +504,24 @@ local function GetPlayerController()
 end
 
 local function GiveSelected()
-    local id = state.itemId
-    if id == nil or id == "" then
-        id = ModMenu.Get(SECTION_ID, "item")
-    end
-    id = AsString(id)
+    local id = SelectedItemId()
     if id == nil or id == NONE then
         Log("Give: pick an item first")
+        FlashFeedback("giveItem", false)
         return
     end
 
-    local n = tonumber(ModMenu.Get(SECTION_ID, AMOUNT_ID)) or 0
-    n = math.floor(n)
+    local n = SelectedAmount()
     if n < 1 then
         Log("Give: amount must be >= 1")
+        FlashFeedback("giveItem", false)
         return
     end
 
     local pc = GetPlayerController()
     if not pc then
         Log("Give: no player controller (load into a world first)")
+        FlashFeedback("giveItem", false)
         return
     end
 
@@ -397,9 +531,98 @@ local function GiveSelected()
     end)
     if ok then
         Log(string.format("Give: S_AddItemQuantity(%s, %d)", id, n))
+        RefreshInventoryWidgets()
+        FlashFeedback("giveItem", true)
     else
         Log("Give failed — " .. tostring(err))
+        FlashFeedback("giveItem", false)
     end
+end
+
+local function RemoveSelected()
+    local id = SelectedItemId()
+    if id == nil or id == NONE then
+        Log("Give: pick an item first")
+        FlashFeedback("removeItem", false)
+        return
+    end
+
+    local n = SelectedAmount()
+    if n < 1 then
+        Log("Give: amount must be >= 1")
+        FlashFeedback("removeItem", false)
+        return
+    end
+
+    local pc, pawn = GetPawn()
+    if not IsValid(pc) then
+        Log("Give: no player controller (load into a world first)")
+        FlashFeedback("removeItem", false)
+        return
+    end
+
+    local cls = ResolveRowClass(id)
+    if cls == nil then
+        Log("Give: could not resolve class — " .. id)
+        FlashFeedback("removeItem", false)
+        return
+    end
+
+    local world = GetWorldCtx()
+    local playerLib = GetPlayerLib()
+    local removed = false
+    if IsValid(playerLib) and IsValid(world) then
+        local ok, err = pcall(function()
+            playerLib:RemoveItemStacksSilent(cls, n, true, world)
+        end)
+        if ok then
+            removed = true
+        else
+            Log("Give: RemoveItemStacksSilent failed — " .. tostring(err))
+        end
+    end
+
+    if not removed then
+        local mgr = GetItemManager(pawn)
+        if IsValid(mgr) then
+            local ok, err = pcall(function()
+                mgr:RemoveItemStacksByClass(cls, n)
+            end)
+            if ok then
+                removed = true
+            else
+                Log("Give: RemoveItemStacksByClass failed — " .. tostring(err))
+            end
+        end
+    end
+
+    if removed then
+        Log(string.format("Give: removed %d x %s", n, id))
+        RefreshInventoryWidgets()
+        FlashFeedback("removeItem", true)
+    else
+        Log("Give: remove failed — " .. id)
+        FlashFeedback("removeItem", false)
+    end
+end
+
+local function AskRemoveSelected()
+    local id = SelectedItemId()
+    if id == nil or id == NONE then
+        Log("Give: pick an item first")
+        return
+    end
+    local n = SelectedAmount()
+    if n < 1 then
+        Log("Give: amount must be >= 1")
+        return
+    end
+    ModMenu.Confirm({
+        title = string.format("Remove %d?", n),
+        message = ItemLabel(id),
+        confirmLabel = "Remove",
+        onConfirm = RemoveSelected,
+    })
 end
 
 function M.Register()
@@ -457,6 +680,12 @@ function M.Register()
                         label = "Add",
                         onClick = GiveSelected,
                     },
+                    {
+                        type = "button",
+                        id = "removeItem",
+                        label = "Remove",
+                        onClick = AskRemoveSelected,
+                    },
                 },
             },
             {
@@ -469,6 +698,11 @@ function M.Register()
                         type = "button",
                         id = "allItems",
                         label = "Give All Items",
+                        confirm = {
+                            title = "Give all items?",
+                            message = "Adds every pickup. This cannot be undone here.",
+                            confirmLabel = "Give all",
+                        },
                         onClick = function()
                             local pc = GetPlayerController()
                             if not pc then

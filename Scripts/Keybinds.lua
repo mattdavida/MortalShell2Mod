@@ -4,7 +4,7 @@
   UE4SS cannot unregister a key, so every bindable Key is registered once and
   dispatched against the current dropdown values. Unbound = None. Fires while
   the menu is closed. Toggle binds flip Cheats → Toggles. Switch Shell binds
-  call the same Switch as the Shells tab. Heal / Resolve amounts come from Combat.
+  call the same Switch as the Shells tab. Heal / Resolve / Damage to come from Combat.
 ]]
 
 local ModMenu = require("ModMenu.ModMenu")
