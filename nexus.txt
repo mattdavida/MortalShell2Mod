@@ -6,7 +6,8 @@ In-game cheat menu for Mortal Shell II. Press F6.
 Five tabs: Cheats, Shells, Give, Unlocks, Keybinds. Dock left or right.
 Sections collapse so each tab stays short.
 
-Change any shell anywhere (including Harros after the prologue). Unlocks,
+Change any shell anywhere (including Harros after the prologue). Shell and
+tarstone names come from the game, so they match your language. Unlocks,
 give any pickup, tarstone levels, currencies, heal / resolve / revive /
 shell switch (optional hotkeys). God, Auto Heal, Infinite Resolve, no ability
 cooldowns,
@@ -21,6 +22,22 @@ Tested on UE4SS latest-experimental (UE 5.6).
 
 WARNING: Unlock buttons also fire Steam achievements. Use them only if you
 are fine with that.
+
+
+--------------------------------------------------------------------------------
+  CHANGELOG
+--------------------------------------------------------------------------------
+
+  - Shell and tarstone names come from the game at runtime (your language).
+  - Ten playable shells including Solomon, plus Dark Form.
+  - Tarstones: add one stone without selecting it; Collected defaults to None.
+  - Damage Player replaces Break Shell. Hits the current bar (shell if worn)
+    down to a saved percent — does not dump the shell. Dark Form is on Shells.
+    Optional keybind. Revive Player is first in Combat.
+  - Give Item: Remove takes the same pickup and amount as Add, after Are you sure?
+  - Are you sure? before Add All Tarstones, Give All Items, every Unlock All /
+    shade / harbinger, Unlock Map, Reveal All Icons, and Ovums.
+  - Cancel or close the menu leaves those actions undone.
 
 
 --------------------------------------------------------------------------------
@@ -75,10 +92,10 @@ Launch the game, load into a world, press F6.
       Keybinds. Dock left or right with the Dock button. Click a section
       header to expand or collapse it.
 
-  Heal / Resolve / Revive / toggle / shell-switch keybinds
+  Heal / Resolve / Damage / Revive / toggle / shell-switch keybinds
       Optional. Set them under the Keybinds tab. They fire while the menu
-      is closed. Heal / Resolve use the amounts from Combat. Saved to
-      Mods/MortalShell2Mod/config.json.
+      is closed. Heal / Resolve use the amounts from Combat. Damage Player
+      uses Damage to. Saved to Mods/MortalShell2Mod/config.json.
 
   Laptop / compact keyboard
       If F6 does nothing, try Fn+F6.
@@ -117,7 +134,9 @@ Launch the game, load into a world, press F6.
 
   Always Perfect Block
       While blocking with the Untarnished Seal, every hit is a perfect block.
-      Saved ON retries on load. Equip the seal first or a click-on unchecks.
+      Saved ON stays checked and retries every 1s until the live ability
+      exists (not the early default object). A click-on without the ability
+      unchecks.
 
   Always Perfect Harden
       While hardened with Vatra's Seal, every hit is a perfect harden.
@@ -142,7 +161,12 @@ Launch the game, load into a world, press F6.
       Re-applies after death / pawn restart.
 
   COMBAT
-      Set the number, then press Add (default 100). Amounts are saved.
+      Set the number, then press Add (default 100). Amounts and Damage to
+      are saved.
+
+  Revive Player
+      Puts you back in the shell (S_ReviveShell). Use after the shell dies
+      and you are fighting unshelled.
 
   Heal
       Heals by the entered amount.
@@ -150,13 +174,12 @@ Launch the game, load into a world, press F6.
   Resolve
       Gains Resolve by the entered amount.
 
-  Break Shell
-      Deals current shell HP as damage (S_DealDamage) so the in-game
-      shell-break path runs. Turn Auto Heal off first.
-
-  Revive Player
-      Puts you back in the shell (S_ReviveShell). Use after the shell dies
-      and you are fighting unshelled.
+  Damage Player
+      S_DealDamage on the current bar only: shell HP while worn, flesh
+      when unshelled or in Dark Form. Damage to (saved) is the remaining
+      percent — 35 / 40 / 50 match the low-health tarstone breakpoints.
+      Never deals enough to empty the shell. Want Dark Form? Switch on
+      the Shells tab. Turn Auto Heal off first. Optional keybind.
 
 
 --------------------------------------------------------------------------------
@@ -165,20 +188,13 @@ Launch the game, load into a world, press F6.
 
   SWITCH SHELL
       Change shell anywhere. Skips the shrine / pickup gate.
-      The current shell is marked (equipped). Does not learn names — do that
-      in-game if you want the lore.
+      The list is the game's playable shells (ten, including Solomon) plus
+      Dark Form. Button names use the game's localized display name — they
+      are not hardcoded English titles. The current shell is marked
+      (equipped). Does not learn names — do that in-game if you want the lore.
 
-  Harros, the Vassal
+  Harros
       Prologue shell. Restored even after the Tar Golem fight petrifies him.
-
-  Tiel, the Acolyte
-  Eredrim, the Venerable
-  Proxima, the Broodseer
-  Gragu, the Insatiable
-  Smert, the Apostate
-  Genessa, the Wayward
-  Lazlo, the Justicar
-  Sariel, the Endless
 
   Dark Form
       ActivateDarkForm (keep anims playing, reinit pose). Success is an
@@ -221,12 +237,13 @@ Launch the game, load into a world, press F6.
       Shell Toggles.
 
   SWITCH SHELL
-      One dropdown per Shells → Switch Shell button (nine shells + Dark Form).
-      Same as clicking that button. Load into a world first.
+      One dropdown per Shells → Switch Shell button (every playable shell +
+      Dark Form). Same as clicking that button. Load into a world first.
 
   COMBAT
       Heal / Resolve fire the Combat amounts (they are not toggles).
-      Revive Player fires S_ReviveShell (same as Cheats → Combat).
+      Damage Player uses Damage to. Revive Player fires S_ReviveShell
+      (same as Cheats → Combat).
 
 
 --------------------------------------------------------------------------------
@@ -234,41 +251,53 @@ Launch the game, load into a world, press F6.
 --------------------------------------------------------------------------------
 
   TARSTONES
+      Names come from the in-game tables (your language). Load into a world
+      first so the lists can fill.
+
+  Category / Tarstone / Add
+      Filter by All / Melee / Sidearm / Support, pick one stone, then Add.
+      Adding a stone does not select it under Collected.
+
+  Collected
+      Stones you already have. Defaults to None. Increment / Decrement
+      Level do nothing until you pick a stone. Status shows that stone's
+      level (1 / 3). Re-equip after a change so effects apply.
 
   Add All Tarstones (Melee / Support / Sidearm)
-      Adds all tarstones of that type. The button flashes green briefly.
+      Behind a collapsed header. Asks Are you sure? before granting every
+      stone of that type. The button flashes green briefly.
 
-  Increment All Tarstone Levels
-      Raises every tarstone you currently have by one (UI 1 → 2 → 3).
-      Max is 3. After a change, a short note reminds you to re-equip so the
-      new effects apply.
-
-  Decrement All Tarstone Levels
-      Lowers every tarstone you currently have by one (UI 3 → 2 → 1).
-      Re-equip after changing levels to refresh effects.
+  Level All Tarstones
+      Behind a collapsed header. Increment All / Decrement All raise or
+      lower every stone you have (UI 1 → 2 → 3). Max is 3. Re-equip after
+      a change so the new effects apply.
 
   GIVE ITEM
 
   Item
       Searchable list of pickups. Type to filter, pick one, set Amount
-      (defaults to 1; resets to 1 when you pick a different item), then Add.
-      Load into a world first so the pickup table can load.
+      (defaults to 1; resets to 1 when you pick a different item), then
+      Add or Remove. Remove asks Are you sure? first. Load into a world
+      first so the pickup table can load.
 
   Give All Items
-      Behind a collapsed header at the bottom of Give Item (after Add),
-      so it is not one click away. Adds every item.
+      Behind a collapsed header at the bottom of Give Item (after Add).
+      Asks Are you sure? then adds every item.
 
   QUICK ADDS
       Set the number, then press Add (default 100).
 
   Gold / Gloom / Glimpses / Shell Points / Tarcores / Ventrium / Laterite /
   Dorsalite / Thoracium / Ovums
+      Ovums ask Are you sure? first.
 
 
 --------------------------------------------------------------------------------
   UNLOCKS
 --------------------------------------------------------------------------------
       Steam achievements unlock with these. Load into a world first.
+      Unlock All, shades, harbingers, Unlock Map, and Reveal All ask
+      Are you sure? first. Cancel or close the menu does nothing.
       Each unlock flashes green briefly and shows a short Done note.
 
   UNLOCKS
@@ -290,7 +319,7 @@ Launch the game, load into a world, press F6.
   MAP
 
   Unlock Map
-      Fills the map.
+      Asks Are you sure? then fills the map.
 
   Unlock Fast Travel
 
@@ -306,7 +335,8 @@ Launch the game, load into a world, press F6.
     (they need a live player controller).
 
   - Unlock buttons fire Steam achievements. There is no "Unlock Everything"
-    on purpose — that spammed achievement notifications.
+    on purpose — that spammed achievement notifications. Bulk give / unlock
+    / ovum buttons ask Are you sure? first; Cancel does nothing.
 
   - God / Auto Heal / Infinite Resolve / No Ability Cooldown / Auto Parry on Hit /
     Always Perfect Block / Always Perfect Harden / Max Shell Points 100 /
@@ -315,9 +345,9 @@ Launch the game, load into a world, press F6.
 
   - Seal toggles need the matching seal equipped (Infinite / Untarnished /
     Vatra's). A click-on without the seal unchecks. Saved ON stays checked
-    and retries when you load a world; a note shows until the ability is
-    ready. If you swap seals, turn the toggle off and on again. Perfect
-    Block can hook on equip; parry and harden often need that retoggle.
+    and retries when you load a world until the live ability exists; a
+    note shows Waiting for ability until then. If you swap seals, turn
+    the toggle off and on again.
 
   - Smert Stealth / Spawn Clone / Lazlo Detonation need that shell equipped.
     If the ability is not loaded, the checkbox turns itself off.
@@ -328,10 +358,14 @@ Launch the game, load into a world, press F6.
     leave it off next time.
 
   - Keybinds do not fire while the F6 menu is open. Close the menu, then
-    press the bound key. Heal / Resolve amounts always come from Combat.
+    press the bound key. Heal / Resolve amounts and Damage to always come
+    from Combat.
 
-  - After increment / decrement tarstone levels, re-equip the stones or the
-    UI / effects can look stale (especially at level 3).
+  - After increment / decrement tarstone levels (one stone or all), re-equip
+    the stones or the UI / effects can look stale (especially at level 3).
+
+  - Shell and tarstone button / list names are read from the game at runtime
+    so non-English players see the same names as the HUD.
 
   - This game needs the included StaticConstructObject.lua signature under
     ue4ss\UE4SS_Signatures\ or UE4SS may fail to start.
