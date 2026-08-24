@@ -39,7 +39,7 @@ local menuKey = Keybinds.ResolveMenuKey()
 ModMenu.Init({
     title = "Mortal Shell 2",
     instanceId = "MortalShell2Mod",
-    pointerMode = "touch",
+    -- pointerMode = "touch",
     key = menuKey.code or Key.F6,
     keyHint = menuKey.name,
     dock = "right",
