@@ -174,6 +174,30 @@ Saved across launches (`config.json` next to the mod). Fires while the menu is c
 
 Install from the [Nexus release](https://www.nexusmods.com/mortalshell2/mods/20) — full package and already-have-UE4SS steps live there.
 
+### Build (contributors)
+
+Edit and test the multi-file `Scripts/` tree. Release is a single `main.lua` (same idea as ModMenu):
+
+```bash
+npm run bundle   # dist/MortalShell2Mod.bundle.lua
+npm run deploy   # dist/MortalShell2Mod.zip → extract into ue4ss/Mods/
+```
+
+```
+ue4ss/Mods/
+  MortalShell2Mod/
+    enabled.txt
+    LICENSE
+    Scripts/
+      main.lua              ← bundled runtime
+  shared/
+    ModMenu/                ← not bundled; still required
+    ConfigManager/          ← not bundled; still required
+    UEHelpers/              ← stock UE4SS
+```
+
+`Scripts/*.lua` (except `main.lua`) are auto-bundled. `ModMenu`, `ConfigManager`, and `UEHelpers` stay as `require`s.
+
 ---
 
 ## Notes
